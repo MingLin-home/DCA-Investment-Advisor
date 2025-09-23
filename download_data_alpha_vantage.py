@@ -308,22 +308,16 @@ def build_output_df(
         for d in dates.to_pydatetime()
     ]
 
-    # Helper: linear interpolation on the time axis using pandas time-based interpolation
-    def _interp(dates_index: pd.DatetimeIndex, mapping: Dict[pd.Timestamp, float]) -> List[Optional[float]]:
+    # Map values only on exact available dates; do not impute missing values
+    def _exact(dates_index: pd.DatetimeIndex, mapping: Dict[pd.Timestamp, float]) -> List[Optional[float]]:
         if not mapping:
             return [None] * len(dates_index)
-        s = pd.Series(mapping, dtype=float)
-        # ensure proper datetime index without tz
-        s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
-        s = s[~s.index.duplicated(keep="last")].sort_index()
-        s_re = s.reindex(dates_index)
-        s_interp = s_re.interpolate(method="time")
-        return [None if pd.isna(x) else float(x) for x in s_interp.to_numpy()]
+        return [mapping.get(d) for d in dates_index]
 
-    eps_vals = _interp(dates, eps_series)
-    fcf_vals = _interp(dates, fcf_series)
-    pbr_vals = _interp(dates, pbr_series)
-    roe_vals = _interp(dates, roe_series)
+    eps_vals = _exact(dates, eps_series)
+    fcf_vals = _exact(dates, fcf_series)
+    pbr_vals = _exact(dates, pbr_series)
+    roe_vals = _exact(dates, roe_series)
 
     out = pd.DataFrame(
         {
@@ -354,9 +348,7 @@ def main():
 
     # Create output directories
     base_dir = args.output
-    data_dir = os.path.join(base_dir, "data")
     raw_dir = os.path.join(base_dir, "raw_data")
-    os.makedirs(data_dir, exist_ok=True)
     os.makedirs(raw_dir, exist_ok=True)
 
     cfg = load_config(args.config)
@@ -377,14 +369,6 @@ def main():
                 print(f"[WARN] No price data returned for {sym}; skipping.")
                 continue
 
-            # Save raw price history for debugging
-            try:
-                raw_path = os.path.join(raw_dir, f"{sym}.raw.csv")
-                hist.to_csv(raw_path)
-                print(f"[DEBUG] Wrote raw data to {raw_path}")
-            except Exception as e:
-                print(f"[WARN] Failed to write raw data for {sym}: {e}")
-
             print(f"[INFO] Fetching fundamentals for {sym} via Alpha Vantage (historical series, no interpolation) ...")
             eps_series = fetch_eps_series(sym, api_key)
             fcf_series = fetch_fcf_series(sym, api_key)
@@ -392,7 +376,8 @@ def main():
             roe_series = compute_roe_series(sym, api_key)
 
             out_df = build_output_df(sym, hist, eps_series, fcf_series, pbr_series, roe_series)
-            out_path = os.path.join(data_dir, f"{sym}.csv")
+            # Save final CSV under raw_data/{SYMBOL}.csv as requested
+            out_path = os.path.join(raw_dir, f"{sym}.csv")
             out_df.to_csv(out_path, index=False)
             print(f"[OK] Wrote {len(out_df)} rows to {out_path}")
             any_ok = True
