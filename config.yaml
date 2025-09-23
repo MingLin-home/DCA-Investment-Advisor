@@ -1,0 +1,23 @@
+stock_symbols:
+# - VOO
+# - VGT
+# - QQQ
+# - NVDA
+# - META
+# - NFLX
+# - MSFT
+# - AMZN
+# - AVGO
+# - TSLA
+# - GOOGL
+# - GOOG
+# - COST
+# - PEP
+# - CSCO
+# - QCOM
+# - ADBE
+- INTC
+
+stock_start_date: 2020-01-01
+stock_end_date: today
+stock_api: yfinance
