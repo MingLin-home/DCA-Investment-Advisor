@@ -42,3 +42,14 @@ Notes:
 - CSV columns: `stock_symbol`, `date`, `avg_price`, `timestamp`, `ESP`, `FCF`, `PBR`, `ROE`.
 - `avg_price` is computed as (High + Low + Close) / 3 for each day.
 - Fundamental fields are latest available values repeated across days (may be missing for some symbols).
+
+### Using Alpha Vantage
+
+An alternative script uses the Alpha Vantage API instead of yfinance. Set your API key in the environment variable `alpha_vantage_api_key` and run:
+
+```
+export alpha_vantage_api_key=YOUR_KEY
+python download_data_alpha_vantage.py --config config.yaml --output outputs
+```
+
+It writes CSVs with the same schema as above. Respect free-tier rate limits when downloading many symbols.
