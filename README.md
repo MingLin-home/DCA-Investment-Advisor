@@ -53,3 +53,8 @@ python download_data_alpha_vantage.py --config config.yaml --output outputs
 ```
 
 It writes CSVs with the same schema as above to `outputs/raw_data/{SYMBOL}.csv` and does not save a separate `.raw.csv` file. Respect free-tier rate limits when downloading many symbols.
+
+
+## Loss function
+
+$ \mathcal{L}(x, y) = \log \sigma(x) + \frac{1}{2} \frac{(y-\mu(x))^2} sigma(x)^2} $
