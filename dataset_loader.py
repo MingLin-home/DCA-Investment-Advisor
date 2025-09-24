@@ -48,13 +48,29 @@ class SingleStockDataset:
         df = df[self.columns]
 
         # Convert to tensor (float32); timestamps as float for tensor homogeneity
-        self.data = torch.tensor(df.to_numpy(dtype=float), dtype=torch.float32)
+        data_raw = torch.tensor(df.to_numpy(dtype=float), dtype=torch.float32)
 
-        # Pre-compute per-column normalization statistics
+        # Column index mapping for convenience
+        self.col_index = {name: i for i, name in enumerate(self.columns)}
+
+        # Pre-compute per-column normalization statistics using NaN-aware ops
         # Use population std (unbiased=False) and guard against zeros
-        self.mean: torch.Tensor = self.data.mean(dim=0)
-        std = self.data.std(dim=0, unbiased=False)
-        self.std: torch.Tensor = torch.clamp(std, min=1e-8)
+        # Keep both vector forms and per-column dicts
+        mean_vec = torch.nanmean(data_raw, dim=0)
+        std_vec = torch.nanstd(data_raw, dim=0, unbiased=False)
+        std_vec = torch.clamp(std_vec, min=1e-8)
+
+        # Store vector stats for multi-column normalization
+        self._mean_vec: torch.Tensor = mean_vec
+        self._std_vec: torch.Tensor = std_vec
+
+        # Store per-column stats as dict of scalars for single-column ops
+        self.mean = {col: mean_vec[i].clone() for col, i in self.col_index.items()}
+        self.std = {col: std_vec[i].clone() for col, i in self.col_index.items()}
+
+        # Normalize data immediately and keep both raw and normalized versions
+        self._data_raw = data_raw
+        self.data = (data_raw - mean_vec) / std_vec
 
         # Keep a copy of timestamps for date range sampling and direct lookup
         df_all = pd.read_csv(csv_path, usecols=["timestamp"])  # raises if column missing
@@ -201,46 +217,60 @@ class SingleStockDataset:
     def get_timestamp_from_date(self, date_str: str) -> int:
         """Return epoch-seconds timestamp for given date (YYYY-MM-DD, UTC midnight)."""
         return self._parse_date_to_ts(date_str)
-
-
-
-    def get_data_at_index(self, index: int) -> torch.Tensor:
-        """Return feature vector [num_columns] at dataset row `index`.
-
-        Valid indices are 0 <= index < len(self).
-        """
-        try:
-            idx = int(index)
-        except Exception as e:
-            raise ValueError(f"Invalid index value: {index}") from e
-
-        n = len(self)
-        if not (0 <= idx < n):
-            raise ValueError(f"Index {idx} out of bounds for dataset of size {n}")
-        return self.data[idx]
+    
 
     # --- Normalization helpers ---
-    def normalize(self, data: torch.Tensor) -> torch.Tensor:
-        """Normalize data using dataset mean/std per column.
+    def normalize(self, data: torch.Tensor, column_name: Optional[str] = None) -> torch.Tensor:
+        """Normalize data using dataset mean/std.
 
-        Accepts shape (..., num_columns) and broadcasts stats across leading dims.
+        - If column_name is None: expects shape (..., num_columns) and broadcasts
+          vector stats across leading dims.
+        - If column_name is provided: expects shape [N, M] where N is batch size
+          and M is number of time points (days). Uses scalar stats for that column.
         """
         if not isinstance(data, torch.Tensor):
             raise TypeError("data must be a torch.Tensor")
-        m = self.mean.to(device=data.device, dtype=data.dtype)
-        s = self.std.to(device=data.device, dtype=data.dtype)
-        return (data - m) / s
 
-    def denormalize(self, data: torch.Tensor) -> torch.Tensor:
+        if column_name is None:
+            m = self._mean_vec.to(device=data.device, dtype=data.dtype)
+            s = self._std_vec.to(device=data.device, dtype=data.dtype)
+            return (data - m) / s
+        else:
+            if column_name not in self.col_index:
+                raise KeyError(f"Unknown column: {column_name}. Available: {self.columns}")
+            if data.dim() != 2:
+                raise ValueError(
+                    f"When column_name is provided, data must be 2D [N, M]; got shape {tuple(data.shape)}"
+                )
+            m = self.mean[column_name].to(device=data.device, dtype=data.dtype)
+            s = self.std[column_name].to(device=data.device, dtype=data.dtype)
+            return (data - m) / s
+
+    def denormalize(self, data: torch.Tensor, column_name: Optional[str] = None) -> torch.Tensor:
         """Invert normalization: x = data * std + mean.
 
-        Accepts shape (..., num_columns) and broadcasts stats across leading dims.
+        - If column_name is None: accepts shape (..., num_columns) and broadcasts
+          vector stats across leading dims.
+        - If column_name is provided: expects shape [N, M] where N is batch size
+          and M is number of time points (days). Uses scalar stats for that column.
         """
         if not isinstance(data, torch.Tensor):
             raise TypeError("data must be a torch.Tensor")
-        m = self.mean.to(device=data.device, dtype=data.dtype)
-        s = self.std.to(device=data.device, dtype=data.dtype)
-        return data * s + m
+
+        if column_name is None:
+            m = self._mean_vec.to(device=data.device, dtype=data.dtype)
+            s = self._std_vec.to(device=data.device, dtype=data.dtype)
+            return data * s + m
+        else:
+            if column_name not in self.col_index:
+                raise KeyError(f"Unknown column: {column_name}. Available: {self.columns}")
+            if data.dim() != 2:
+                raise ValueError(
+                    f"When column_name is provided, data must be 2D [N, M]; got shape {tuple(data.shape)}"
+                )
+            m = self.mean[column_name].to(device=data.device, dtype=data.dtype)
+            s = self.std[column_name].to(device=data.device, dtype=data.dtype)
+            return data * s + m
 
     # --- Timestamp index lookup ---
     def get_index_from_timestamp(self, ts: int) -> int:
@@ -272,3 +302,19 @@ class SingleStockDataset:
             if not np.any(mask):
                 raise ValueError(f"No index found with timestamp <= {ts_int}")
             return int(np.nonzero(mask)[0].max())
+
+    # --- Accessors respecting normalization and sampling range ---
+    def get_data_at_index(self, index: int) -> torch.Tensor:
+        """Return normalized feature vector [num_columns] at dataset row `index`.
+
+        Valid indices are 0 <= index < len(self).
+        """
+        try:
+            idx = int(index)
+        except Exception as e:
+            raise ValueError(f"Invalid index value: {index}") from e
+
+        n = len(self)
+        if not (0 <= idx < n):
+            raise ValueError(f"Index {idx} out of bounds for dataset of size {n}")
+        return self.data[idx]

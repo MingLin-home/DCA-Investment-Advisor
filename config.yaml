@@ -1,3 +1,4 @@
+output_dir: "./outputs"
 stock_symbols:
 # - VOO
 # - VGT
@@ -20,8 +21,9 @@ stock_symbols:
 
 stock_start_date: 2020-01-01
 stock_end_date: 2025-01-01
-stock_api: yfinance
+# stock_api: yfinance
 sampling_start_date: 2020-01-01
-sampling_end_date: 2024-06-01
+sampling_end_date: 2025-01-01
 history_window_size: 360
 predict_window_size: 180
+agg_window_size: 30
