@@ -1,6 +1,5 @@
 import os
 from typing import List, Optional, Sequence
-from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -103,10 +102,7 @@ class SingleStockDataset:
         """If config.yaml defines sampling_start_date/end_date, apply date range.
 
         Supported values per key:
-        - 'YYYY-MM-DD' (ISO)
-        - 'today'
-        - 'today-N' where N is non-negative integer days offset
-        - None or empty -> ignored for that bound
+        - 'YYYY-MM-DD' (ISO) or None/empty to ignore that bound.
         """
         cfg_path = os.path.join("config.yaml")
         if not os.path.isfile(cfg_path):
@@ -121,12 +117,8 @@ class SingleStockDataset:
         raw_start = cfg.get("sampling_start_date")
         raw_end = cfg.get("sampling_end_date")
 
-        try:
-            start_str = self._normalize_sampling_date(raw_start)
-            end_str = self._normalize_sampling_date(raw_end)
-        except Exception:
-            # If parsing fails, don't change default range
-            return
+        start_str = self._normalize_sampling_date(raw_start)
+        end_str = self._normalize_sampling_date(raw_end)
 
         # Only apply if at least one bound is provided
         if start_str is not None or end_str is not None:
@@ -134,28 +126,16 @@ class SingleStockDataset:
 
     @staticmethod
     def _normalize_sampling_date(val: Optional[str]) -> Optional[str]:
-        """Normalize supported date expressions to 'YYYY-MM-DD' or return None.
+        """Normalize date to 'YYYY-MM-DD' or return None if missing/empty.
 
-        Accepts ISO date string, 'today', or 'today-N'. Whitespace ignored.
+        Accepts only ISO date string 'YYYY-MM-DD'. Whitespace is ignored.
         """
         if val is None:
             return None
         s = str(val).strip()
         if s == "":
             return None
-        low = s.lower()
-        if low == "today":
-            return date.today().strftime("%Y-%m-%d")
-        if low.startswith("today-"):
-            try:
-                n = int(low.split("-", 1)[1])
-            except Exception as e:
-                raise ValueError(f"Invalid today-offset format: {val}") from e
-            if n < 0:
-                raise ValueError("Offset for 'today-N' must be non-negative")
-            d = date.today() - timedelta(days=n)
-            return d.strftime("%Y-%m-%d")
-        # Otherwise, expect an ISO-like date; validate via pandas
+        # Expect ISO-like date; validate via pandas with strict format
         try:
             dt = pd.to_datetime(s, format="%Y-%m-%d", utc=True)
             return dt.strftime("%Y-%m-%d")
