@@ -375,3 +375,49 @@ class SingleStockDataset:
             "sample_data": sample_data,
             "future_price": future_price,
         }
+
+
+def extract_price_trend(price_array: np.ndarray) -> dict:
+    """Estimate linear trend p_t ≈ k*t + b for a 1D price series.
+
+    - Input: `price_array` as a NumPy array of shape (N,).
+    - Uses least squares regression over t = 0..N-1 to find k, b that minimize
+      sum_t (k*t + b - p_t)^2.
+    - Returns a dict with keys: 'k', 'b', 'std', where 'std' is the population
+      standard deviation of residuals (p_t - (k*t + b)).
+    """
+    p = np.asarray(price_array, dtype=np.float64)
+    if p.ndim != 1:
+        raise ValueError(f"price_array must be 1D (N,), got shape {tuple(p.shape)}")
+    N = int(p.shape[0])
+    if N == 0:
+        raise ValueError("price_array must be non-empty")
+    if N == 1:
+        k = 0.0
+        b = float(p[0])
+        price_std = 0.0
+        return {"k": k, "b": b, "std": price_std}
+
+    t = np.arange(N, dtype=np.float64)
+    t_mean = t.mean()
+    p_mean = p.mean()
+
+    # Compute slope and intercept via closed-form least squares
+    t_centered = t - t_mean
+    p_centered = p - p_mean
+    denom = np.sum(t_centered * t_centered)
+    if denom == 0.0:
+        # Fallback (shouldn't happen for N>=2 with distinct t)
+        k = 0.0
+    else:
+        k = float(np.sum(t_centered * p_centered) / denom)
+    b = float(p_mean - k * t_mean)
+
+    residuals = p - (k * t + b)
+    price_std = float(np.std(residuals, ddof=0))
+
+    return {
+        "k": k,
+        "b": b,
+        "std": price_std,
+    }
