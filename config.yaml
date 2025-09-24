@@ -1,4 +1,10 @@
 output_dir: "./outputs"
+columns:
+- avg_price
+- timestamp
+- ESP
+- ROE
+
 stock_symbols:
 # - VOO
 # - VGT

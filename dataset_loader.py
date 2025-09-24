@@ -1,5 +1,5 @@
 import os
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -13,24 +13,32 @@ class SingleStockDataset:
     def __init__(
         self,
         stock_symbol: str,
-        columns: Optional[Sequence[str]] = None,
     ) -> None:
         """
         Loads stock CSV data into a NumPy array of shape (num_rows, num_columns).
 
         - CSV path: ./outputs/data/<stock_symbol>.csv
-        - Default columns: ["avg_price", "timestamp", "ESP", "ROE"]
+        - Columns are read from config.yaml under the key 'columns'.
         - self.data[:, 0] = avg_price, etc.
         """
 
-        if columns is None:
-            columns = ["avg_price", "timestamp", "ESP", "ROE"]
-
-        if not isinstance(columns, (list, tuple)) or len(columns) == 0:
-            raise ValueError("columns must be a non-empty sequence of column names")
-
         self.stock_symbol: str = stock_symbol
-        self.columns: List[str] = list(columns)
+
+        # Load config (once) to fetch columns and later sampling settings
+        self.cfg = {}
+        cfg_path = os.path.join("config.yaml")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r") as f:
+                    self.cfg = yaml.safe_load(f) or {}
+            except Exception:
+                self.cfg = {}
+
+        # Read columns from config.yaml
+        cfg_columns = (self.cfg or {}).get("columns")
+        if not isinstance(cfg_columns, list) or not cfg_columns or not all(isinstance(c, str) for c in cfg_columns):
+            raise ValueError("config.yaml must define 'columns' as a non-empty list of strings")
+        self.columns: List[str] = list(cfg_columns)
 
         # Load CSV
         csv_path = os.path.join("outputs", "data", f"{stock_symbol}.csv")
@@ -88,16 +96,6 @@ class SingleStockDataset:
         # Default sampling range is the full dataset (Python slice semantics: [from_idx:to_idx))
         self._from_idx: int = 0
         self._to_idx: int = self.data.shape[0]
-
-        # Load config once and store for reuse
-        self.cfg = {}
-        cfg_path = os.path.join("config.yaml")
-        if os.path.isfile(cfg_path):
-            try:
-                with open(cfg_path, "r") as f:
-                    self.cfg = yaml.safe_load(f) or {}
-            except Exception:
-                self.cfg = {}
 
         # Optionally narrow sampling range using sampling_* keys from config
         self._apply_sampling_range_from_config()
