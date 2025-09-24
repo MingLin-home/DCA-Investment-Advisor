@@ -87,7 +87,17 @@ class SingleStockDataset:
         self._from_idx: int = 0
         self._to_idx: int = self.data.shape[0]
 
-        # Optionally narrow sampling range from config.yaml using sampling_* keys
+        # Load config once and store for reuse
+        self.cfg = {}
+        cfg_path = os.path.join("config.yaml")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r") as f:
+                    self.cfg = yaml.safe_load(f) or {}
+            except Exception:
+                self.cfg = {}
+
+        # Optionally narrow sampling range using sampling_* keys from config
         self._apply_sampling_range_from_config()
 
     # --- Utilities ---
@@ -116,14 +126,9 @@ class SingleStockDataset:
         Supported values per key:
         - 'YYYY-MM-DD' (ISO) or None/empty to ignore that bound.
         """
-        cfg_path = os.path.join("config.yaml")
-        if not os.path.isfile(cfg_path):
-            return
-        try:
-            with open(cfg_path, "r") as f:
-                cfg = yaml.safe_load(f) or {}
-        except Exception:
-            # If config can't be read, skip applying sampling range
+        cfg = getattr(self, "cfg", None)
+        if not cfg:
+            # No config available; nothing to apply
             return
 
         raw_start = cfg.get("sampling_start_date")
@@ -330,21 +335,13 @@ class SingleStockDataset:
         - sample_data: torch.float32 tensor of shape [history_window_size, num_columns]
         - future_price: torch.float32 tensor of shape [future_window_size]
         """
-        # Load window sizes from config.yaml
-        cfg_path = os.path.join("config.yaml")
-        history_window_size = None
-        future_window_size = None
-        if os.path.isfile(cfg_path):
-            try:
-                with open(cfg_path, "r") as f:
-                    cfg = yaml.safe_load(f) or {}
-                history_window_size = int(cfg.get("history_window_size"))
-                future_window_size = int(cfg.get("future_window_size"))
-            except Exception:
-                pass
-
-        if history_window_size is None or future_window_size is None:
-            raise ValueError("history_window_size and future_window_size must be set in config.yaml")
+        # Load window sizes from cached config (set in __init__)
+        cfg = getattr(self, "cfg", {}) or {}
+        try:
+            history_window_size = int(cfg.get("history_window_size"))
+            future_window_size = int(cfg.get("future_window_size"))
+        except Exception as e:
+            raise ValueError("history_window_size and future_window_size must be set in config.yaml") from e
 
         # Compute valid sampling range considering previously applied date sampling
         start_index = int(self._from_idx) + history_window_size
@@ -359,25 +356,12 @@ class SingleStockDataset:
         # Randomly choose i in [start_index, end_index_exclusive)
         i = int(np.random.randint(start_index, end_index_exclusive))
 
-        # Determine which column stores the price
-        price_idx = 0  # default fallback
-        price_candidates = [
-            "avg_price",
-            "price",
-            "close",
-            "adj_close",
-            "adj_close_price",
-        ]
-        for cand in price_candidates:
-            if cand in self.col_index:
-                price_idx = int(self.col_index[cand])
-                break
-        else:
-            # Heuristic: pick the first column containing 'price' (case-insensitive)
-            for col in self.columns:
-                if "price" in str(col).lower():
-                    price_idx = int(self.col_index[col])
-                    break
+        # Determine which column stores the price: always use 'avg_price'
+        if "avg_price" not in self.col_index:
+            raise KeyError(
+                f"'avg_price' column not found in dataset columns {self.columns}"
+            )
+        price_idx = int(self.col_index["avg_price"])
 
         # Slice normalized data
         sample_np = self.data[i - history_window_size : i]
