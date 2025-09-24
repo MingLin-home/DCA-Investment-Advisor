@@ -4,7 +4,9 @@ from typing import List, Optional, Sequence
 import numpy as np
 import pandas as pd
 import yaml
-import torch
+"""
+This module uses NumPy arrays exclusively. PyTorch tensors are not used.
+"""
 
 
 class SingleStockDataset:
@@ -332,8 +334,8 @@ class SingleStockDataset:
         i ∈ [sampling_start_index + history_window_size, sampling_end_index - future_window_size)
 
         Returns a dict with:
-        - sample_data: torch.float32 tensor of shape [history_window_size, num_columns]
-        - future_price: torch.float32 tensor of shape [future_window_size]
+        - sample_data: np.float32 array of shape [history_window_size, num_columns]
+        - future_price: np.float32 array of shape [future_window_size]
         """
         # Load window sizes from cached config (set in __init__)
         cfg = getattr(self, "cfg", {}) or {}
@@ -367,9 +369,9 @@ class SingleStockDataset:
         sample_np = self.data[i - history_window_size : i]
         future_np = self.data[i : i + future_window_size, price_idx]
 
-        # Convert to torch tensors
-        sample_data = torch.as_tensor(sample_np, dtype=torch.float32)
-        future_price = torch.as_tensor(future_np, dtype=torch.float32)
+        # Ensure NumPy float32 arrays (no torch tensors)
+        sample_data = sample_np.astype(np.float32, copy=False)
+        future_price = future_np.astype(np.float32, copy=False)
 
         return {
             "sample_data": sample_data,
