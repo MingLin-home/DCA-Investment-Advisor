@@ -1,9 +1,11 @@
 import os
 from typing import List, Optional, Sequence
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 
 
 class SingleStockDataset:
@@ -54,6 +56,12 @@ class SingleStockDataset:
         # Convert to tensor (float32); timestamps as float for tensor homogeneity
         self.data = torch.tensor(df.to_numpy(dtype=float), dtype=torch.float32)
 
+        # Pre-compute per-column normalization statistics
+        # Use population std (unbiased=False) and guard against zeros
+        self.mean: torch.Tensor = self.data.mean(dim=0)
+        std = self.data.std(dim=0, unbiased=False)
+        self.std: torch.Tensor = torch.clamp(std, min=1e-8)
+
         # Keep a copy of timestamps for date range sampling and direct lookup
         df_all = pd.read_csv(csv_path, usecols=["timestamp"])  # raises if column missing
         self._timestamps: np.ndarray = df_all["timestamp"].to_numpy(dtype=np.int64)
@@ -67,6 +75,9 @@ class SingleStockDataset:
         # Default sampling range is the full dataset (Python slice semantics: [from_idx:to_idx))
         self._from_idx: int = 0
         self._to_idx: int = self.data.shape[0]
+
+        # Optionally narrow sampling range from config.yaml using sampling_* keys
+        self._apply_sampling_range_from_config()
 
     # --- Utilities ---
     @staticmethod
@@ -87,7 +98,71 @@ class SingleStockDataset:
         """Return the total number of rows loaded in the dataset."""
         return int(self.data.shape[0])
 
-    def set_sampling_range(self, from_idx: int, to_idx: int) -> None:
+    # --- Config helpers ---
+    def _apply_sampling_range_from_config(self) -> None:
+        """If config.yaml defines sampling_start_date/end_date, apply date range.
+
+        Supported values per key:
+        - 'YYYY-MM-DD' (ISO)
+        - 'today'
+        - 'today-N' where N is non-negative integer days offset
+        - None or empty -> ignored for that bound
+        """
+        cfg_path = os.path.join("config.yaml")
+        if not os.path.isfile(cfg_path):
+            return
+        try:
+            with open(cfg_path, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            # If config can't be read, skip applying sampling range
+            return
+
+        raw_start = cfg.get("sampling_start_date")
+        raw_end = cfg.get("sampling_end_date")
+
+        try:
+            start_str = self._normalize_sampling_date(raw_start)
+            end_str = self._normalize_sampling_date(raw_end)
+        except Exception:
+            # If parsing fails, don't change default range
+            return
+
+        # Only apply if at least one bound is provided
+        if start_str is not None or end_str is not None:
+            self.set_sample_range_by_date(start_str, end_str)
+
+    @staticmethod
+    def _normalize_sampling_date(val: Optional[str]) -> Optional[str]:
+        """Normalize supported date expressions to 'YYYY-MM-DD' or return None.
+
+        Accepts ISO date string, 'today', or 'today-N'. Whitespace ignored.
+        """
+        if val is None:
+            return None
+        s = str(val).strip()
+        if s == "":
+            return None
+        low = s.lower()
+        if low == "today":
+            return date.today().strftime("%Y-%m-%d")
+        if low.startswith("today-"):
+            try:
+                n = int(low.split("-", 1)[1])
+            except Exception as e:
+                raise ValueError(f"Invalid today-offset format: {val}") from e
+            if n < 0:
+                raise ValueError("Offset for 'today-N' must be non-negative")
+            d = date.today() - timedelta(days=n)
+            return d.strftime("%Y-%m-%d")
+        # Otherwise, expect an ISO-like date; validate via pandas
+        try:
+            dt = pd.to_datetime(s, format="%Y-%m-%d", utc=True)
+            return dt.strftime("%Y-%m-%d")
+        except Exception as e:
+            raise ValueError(f"Unrecognized date format: {val}") from e
+
+    def set_sampling_range_by_index(self, from_idx: int, to_idx: int) -> None:
         """
         Restrict sampling to data[from_idx:to_idx].
 
@@ -104,31 +179,8 @@ class SingleStockDataset:
         self._from_idx = from_idx
         self._to_idx = to_idx
 
-    def get_sample(self) -> torch.Tensor:
-        """
-        Randomly and uniformly sample a contiguous window of length `time_window`
-        from self.data[self._from_idx:self._to_idx].
-
-        Returns: torch.Tensor with shape (time_window, num_columns).
-        Raises: ValueError if time_window >= (to - from).
-        """
-        window = self.time_window
-        start_min = self._from_idx
-        start_max_exclusive = self._to_idx - window  # inclusive start_max = start_max_exclusive
-
-        if window >= (self._to_idx - self._from_idx):
-            raise ValueError(
-                f"time_window ({window}) must be < (to - from) ({self._to_idx - self._from_idx})"
-            )
-
-        # Uniformly choose start index in [start_min, start_max] inclusive
-        start_max = start_max_exclusive
-        start_idx = int(torch.randint(low=start_min, high=start_max + 1, size=(1,)).item())
-        end_idx = start_idx + window
-        return self.data[start_idx:end_idx]
-
     # --- Date-based sampling ---
-    def set_sample_date_range(self, from_date: Optional[str] = None, to_date: Optional[str] = None) -> None:
+    def set_sample_range_by_date(self, from_date: Optional[str] = None, to_date: Optional[str] = None) -> None:
         """
         Set sampling range by date boundaries (YYYY-MM-DD).
 
@@ -168,32 +220,80 @@ class SingleStockDataset:
         # Clamp within dataset bounds and apply
         start_idx = max(0, min(start_idx, len(self)))
         end_idx = max(start_idx, min(end_idx, len(self)))
-        self.set_sampling_range(start_idx, end_idx)
+        self.set_sampling_range_by_index(start_idx, end_idx)
 
     # --- Direct lookup helpers ---
     def get_timestamp_from_date(self, date_str: str) -> int:
         """Return epoch-seconds timestamp for given date (YYYY-MM-DD, UTC midnight)."""
         return self._parse_date_to_ts(date_str)
 
-    def get_data_at_timestamp(self, ts: int) -> torch.Tensor:
-        """Return feature vector [num_columns] at exact timestamp `ts`.
 
-        Raises ValueError if timestamp is not present in the dataset.
+
+    def get_data_at_index(self, index: int) -> torch.Tensor:
+        """Return feature vector [num_columns] at dataset row `index`.
+
+        Valid indices are 0 <= index < len(self).
+        """
+        try:
+            idx = int(index)
+        except Exception as e:
+            raise ValueError(f"Invalid index value: {index}") from e
+
+        n = len(self)
+        if not (0 <= idx < n):
+            raise ValueError(f"Index {idx} out of bounds for dataset of size {n}")
+        return self.data[idx]
+
+    # --- Normalization helpers ---
+    def normalize(self, data: torch.Tensor) -> torch.Tensor:
+        """Normalize data using dataset mean/std per column.
+
+        Accepts shape (..., num_columns) and broadcasts stats across leading dims.
+        """
+        if not isinstance(data, torch.Tensor):
+            raise TypeError("data must be a torch.Tensor")
+        m = self.mean.to(device=data.device, dtype=data.dtype)
+        s = self.std.to(device=data.device, dtype=data.dtype)
+        return (data - m) / s
+
+    def denormalize(self, data: torch.Tensor) -> torch.Tensor:
+        """Invert normalization: x = data * std + mean.
+
+        Accepts shape (..., num_columns) and broadcasts stats across leading dims.
+        """
+        if not isinstance(data, torch.Tensor):
+            raise TypeError("data must be a torch.Tensor")
+        m = self.mean.to(device=data.device, dtype=data.dtype)
+        s = self.std.to(device=data.device, dtype=data.dtype)
+        return data * s + m
+
+    # --- Timestamp index lookup ---
+    def get_index_from_timestamp(self, ts: int) -> int:
+        """
+        Return the largest index i such that timestamp[i] <= ts.
+
+        - If no such index exists (i.e., ts is earlier than the first timestamp),
+          raises ValueError.
+        - Works whether the dataset timestamps are sorted or not, though sorted
+          arrays are handled via binary search for efficiency.
         """
         try:
             ts_int = int(ts)
         except Exception as e:
             raise ValueError(f"Invalid timestamp value: {ts}") from e
 
-        idx = self._ts_to_index.get(ts_int)
-        if idx is None:
-            raise ValueError(f"Timestamp {ts_int} not found in dataset")
-        return self.data[idx]
+        if self._timestamps.size == 0:
+            raise ValueError("Dataset has no timestamps")
 
-    def get_data_at_date(self, date_str: str) -> torch.Tensor:
-        """Return feature vector [num_columns] at given date (YYYY-MM-DD)."""
-        ts = self.get_timestamp_from_date(date_str)
-        return self.get_data_at_timestamp(ts)
-
-# Backwards-compatible alias
-Dataset = SingleStockDataset
+        if self._timestamps_sorted:
+            # Rightmost insertion point minus one gives last index <= ts
+            idx = int(np.searchsorted(self._timestamps, ts_int, side="right") - 1)
+            if idx < 0:
+                raise ValueError(f"No index found with timestamp <= {ts_int}")
+            return idx
+        else:
+            # Fallback for unsorted timestamps
+            mask = self._timestamps <= ts_int
+            if not np.any(mask):
+                raise ValueError(f"No index found with timestamp <= {ts_int}")
+            return int(np.nonzero(mask)[0].max())

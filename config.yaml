@@ -21,3 +21,7 @@ stock_symbols:
 stock_start_date: 2020-01-01
 stock_end_date: today
 stock_api: yfinance
+sampling_start_date: 2020-01-01
+sampling_end_date: today-180
+history_window_size: 360
+predict_window_size: 180
