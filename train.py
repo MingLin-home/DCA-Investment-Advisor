@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        required=True,
+        default="./config.yaml",
         help="Path to YAML configuration file",
     )
     return parser.parse_args()
@@ -148,7 +148,10 @@ def aggregate_history(x: torch.Tensor, agg_window_size: int) -> torch.Tensor:
             "history_window_size must be divisible by agg_windows_size to compute aggregation"
         )
     new_len = x.size(1) // agg_window_size
-    return x.contiguous().view(x.size(0), new_len, agg_window_size).mean(dim=2)
+    x_view = x.contiguous().view(x.size(0), new_len, agg_window_size)
+    x_mean = x_view.mean(dim=2)
+    x_std = x_view.std(dim=2, unbiased=False)
+    return torch.cat((x_mean, x_std), dim=1)
 
 
 def create_optimizer(model: LinearTrendModel, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
@@ -177,7 +180,8 @@ def main() -> None:
         raise ValueError(
             "history_window_size must be divisible by agg_windows_size"
         )
-    reduced_dim = history_window_size // agg_window_size
+    aggregated_length = history_window_size // agg_window_size
+    feature_dim = aggregated_length * 2
 
     batch_size = ensure_positive_int(cfg, "train_batch_size")
     num_workers = int(cfg.get("num_workers", 0))
@@ -209,7 +213,7 @@ def main() -> None:
         pin_memory=False,
     )
 
-    model = LinearTrendModel(reduced_dim)
+    model = LinearTrendModel(feature_dim)
     optimizer = create_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,

@@ -3,45 +3,68 @@ import argparse
 import os
 import sys
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 import pandas as pd
 import yaml
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description=(
             "Impute daily rows for each symbol, ensuring 24h steps and "
             "filling missing numeric values via linear interpolation/extrapolation."
         )
     )
-    p.add_argument(
+    parser.add_argument(
         "--config",
         default="config.yaml",
         help="Path to config.yaml (default: config.yaml)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--output",
-        default="outputs",
+        default=None,
         help=(
-            "Base output directory (default: outputs); reads from <output>/raw_data "
-            "and writes imputed CSVs to <output>/data"
+            "Optional override for base output directory. When omitted, the value "
+            "from config.yaml (output_dir) is used."
         ),
     )
-    return p.parse_args()
+    return parser.parse_args()
 
 
 def load_config(path: str) -> dict:
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    # Minimal validation
+
     if "stock_symbols" not in cfg or not isinstance(cfg["stock_symbols"], list):
         raise ValueError("config.yaml must define 'stock_symbols' as a list")
-    if "stock_start_date" not in cfg:
-        raise ValueError("config.yaml must define 'stock_start_date'")
-    if "stock_end_date" not in cfg:
-        raise ValueError("config.yaml must define 'stock_end_date'")
+
+    for key in ("stock_start_date", "stock_end_date", "output_dir"):
+        if key not in cfg:
+            raise ValueError(f"config.yaml must define '{key}'")
+        if isinstance(cfg[key], str):
+            cfg[key] = cfg[key].strip()
+        if cfg[key] in (None, ""):
+            raise ValueError(f"'{key}' in config.yaml must not be empty")
+
+    columns_cfg = cfg.get("columns")
+    if columns_cfg is not None:
+        if not isinstance(columns_cfg, list) or not all(isinstance(c, str) for c in columns_cfg):
+            raise ValueError("'columns' in config.yaml must be a list of strings when provided")
+        cfg["columns"] = [c.strip() for c in columns_cfg if c.strip()]
+
+    numeric_cfg = cfg.get("numeric_columns")
+    if numeric_cfg is not None:
+        if not isinstance(numeric_cfg, list) or not all(isinstance(c, str) for c in numeric_cfg):
+            raise ValueError("'numeric_columns' in config.yaml must be a list of strings when provided")
+        cfg["numeric_columns"] = [c.strip() for c in numeric_cfg if c.strip()]
+
+    output_columns_cfg = cfg.get("output_columns")
+    if output_columns_cfg is not None:
+        if not isinstance(output_columns_cfg, list) or not all(isinstance(c, str) for c in output_columns_cfg):
+            raise ValueError("'output_columns' in config.yaml must be a list of strings when provided")
+        cfg["output_columns"] = [c.strip() for c in output_columns_cfg if c.strip()]
+
     return cfg
 
 
@@ -86,10 +109,79 @@ def build_complete_calendar(start_d: date, end_d: date) -> pd.DataFrame:
     return df
 
 
-NUMERIC_COLS = ["avg_price", "ESP", "FCF", "PBR", "ROE"]
+DEFAULT_NUMERIC_COLS = ["avg_price", "ESP", "FCF", "PBR", "ROE"]
+DEFAULT_OUTPUT_COLUMNS = [
+    "stock_symbol",
+    "date",
+    "avg_price",
+    "timestamp",
+    "ESP",
+    "FCF",
+    "PBR",
+    "ROE",
+]
 
 
-def impute_symbol(symbol: str, base_dir: str, start_d: date, end_d: date) -> Optional[str]:
+def _dedupe(seq: Iterable[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in seq:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def resolve_numeric_columns(cfg: dict) -> List[str]:
+    if cfg.get("numeric_columns"):
+        numeric = [c.strip() for c in cfg["numeric_columns"] if c.strip()]
+    elif cfg.get("columns"):
+        numeric = [
+            c.strip()
+            for c in cfg["columns"]
+            if c.strip() and c.strip() not in {"date", "timestamp", "stock_symbol"}
+        ]
+    else:
+        numeric = list(DEFAULT_NUMERIC_COLS)
+
+    if not numeric:
+        raise ValueError("Unable to determine numeric columns from config.yaml")
+
+    return _dedupe(numeric)
+
+
+def resolve_output_columns(cfg: dict, numeric_cols: List[str]) -> List[str]:
+    if cfg.get("output_columns"):
+        output_columns = [c for c in cfg["output_columns"] if c]
+    elif cfg.get("columns"):
+        output_columns = ["stock_symbol", "date", *cfg["columns"]]
+    else:
+        output_columns = list(DEFAULT_OUTPUT_COLUMNS)
+
+    mandatory = ["stock_symbol", "date", "timestamp"]
+    for col in numeric_cols:
+        if col not in output_columns:
+            output_columns.append(col)
+    for col in mandatory:
+        if col not in output_columns:
+            # Insert timestamp after date when possible for readability
+            if col == "timestamp" and "date" in output_columns:
+                insert_at = output_columns.index("date") + 1
+                output_columns.insert(insert_at, col)
+            else:
+                output_columns.insert(0, col)
+
+    return _dedupe(output_columns)
+
+
+def impute_symbol(
+    symbol: str,
+    base_dir: str,
+    start_d: date,
+    end_d: date,
+    numeric_cols: List[str],
+    output_columns: List[str],
+) -> Optional[str]:
     data_dir, raw_dir = ensure_dirs(base_dir)
 
     # Prefer Alpha Vantage style path first, fall back to processed data if needed
@@ -109,28 +201,23 @@ def impute_symbol(symbol: str, base_dir: str, start_d: date, end_d: date) -> Opt
         print(f"[ERROR] Failed to read {src_path}: {e}", file=sys.stderr)
         return None
 
-    # Normalize column names and dtypes
-    expected_cols = [
+    required_cols = _dedupe([
         "stock_symbol",
         "date",
-        "avg_price",
         "timestamp",
-        "ESP",
-        "FCF",
-        "PBR",
-        "ROE",
-    ]
-    for c in expected_cols:
-        if c not in df.columns:
-            # Create missing numeric columns as NaN; stock_symbol will be set below
-            df[c] = pd.NA
+        *numeric_cols,
+        *output_columns,
+    ])
 
-    # Coerce numeric columns to float
-    for c in NUMERIC_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
 
-    # Keep only relevant columns
-    df = df[expected_cols]
+    # Coerce numeric columns to float for interpolation
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df[required_cols]
 
     # Build complete daily calendar from config dates
     calendar = build_complete_calendar(start_d, end_d)
@@ -146,7 +233,9 @@ def impute_symbol(symbol: str, base_dir: str, start_d: date, end_d: date) -> Opt
     merged = merged.sort_values("timestamp").reset_index(drop=True)
     merged_indexed = merged.set_index("timestamp")
 
-    for c in NUMERIC_COLS:
+    for c in numeric_cols:
+        if c not in merged_indexed:
+            continue
         s = merged_indexed[c].astype(float)
         # Linear interpolation on index values, extrapolate both ends
         s_interp = s.interpolate(method="index", limit_direction="both")
@@ -158,16 +247,7 @@ def impute_symbol(symbol: str, base_dir: str, start_d: date, end_d: date) -> Opt
     merged["date"] = pd.to_datetime(merged["timestamp"], unit="s", utc=True).dt.strftime("%Y-%m-%d")
 
     # Final column order
-    merged = merged[[
-        "stock_symbol",
-        "date",
-        "avg_price",
-        "timestamp",
-        "ESP",
-        "FCF",
-        "PBR",
-        "ROE",
-    ]]
+    merged = merged[[col for col in output_columns if col in merged.columns]]
 
     # Write output to data_dir/SYM.csv
     out_path = os.path.join(data_dir, f"{symbol}.csv")
@@ -184,6 +264,8 @@ def main():
     args = parse_args()
     cfg = load_config(args.config)
 
+    base_output = args.output.strip() if isinstance(args.output, str) and args.output.strip() else cfg["output_dir"]
+
     symbols: List[str] = [str(s).strip().upper() for s in cfg["stock_symbols"]]
     start_d = parse_date(cfg.get("stock_start_date"))
     end_d = parse_date(cfg.get("stock_end_date"))
@@ -191,10 +273,13 @@ def main():
     if start_d > end_d:
         raise ValueError("stock_start_date must be on or before stock_end_date")
 
+    numeric_cols = resolve_numeric_columns(cfg)
+    output_columns = resolve_output_columns(cfg, numeric_cols)
+
     any_ok = False
     for sym in symbols:
         print(f"[INFO] Imputing {sym} from {start_d} to {end_d} ...")
-        out = impute_symbol(sym, args.output, start_d, end_d)
+        out = impute_symbol(sym, base_output, start_d, end_d, numeric_cols, output_columns)
         if out:
             print(f"[OK] Wrote imputed data to {out}")
             any_ok = True
@@ -208,4 +293,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
