@@ -11,7 +11,6 @@ class SingleStockDataset:
     def __init__(
         self,
         stock_symbol: str,
-        time_window: int,
         columns: Optional[Sequence[str]] = None,
     ) -> None:
         """
@@ -28,11 +27,7 @@ class SingleStockDataset:
         if not isinstance(columns, (list, tuple)) or len(columns) == 0:
             raise ValueError("columns must be a non-empty sequence of column names")
 
-        if not isinstance(time_window, int) or time_window <= 0:
-            raise ValueError("time_window must be a positive integer")
-
         self.stock_symbol: str = stock_symbol
-        self.time_window: int = time_window
         self.columns: List[str] = list(columns)
 
         # Load CSV
