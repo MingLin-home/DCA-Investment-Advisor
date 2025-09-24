@@ -3,8 +3,8 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-import torch
 import yaml
+import torch
 
 
 class SingleStockDataset:
@@ -14,7 +14,7 @@ class SingleStockDataset:
         columns: Optional[Sequence[str]] = None,
     ) -> None:
         """
-        Loads stock CSV data into a tensor of shape (num_rows, num_columns).
+        Loads stock CSV data into a NumPy array of shape (num_rows, num_columns).
 
         - CSV path: ./outputs/data/<stock_symbol>.csv
         - Default columns: ["avg_price", "timestamp", "ESP", "ROE"]
@@ -47,8 +47,8 @@ class SingleStockDataset:
         # Keep only requested columns in the specified order
         df = df[self.columns]
 
-        # Convert to tensor (float32); timestamps as float for tensor homogeneity
-        data_raw = torch.tensor(df.to_numpy(dtype=float), dtype=torch.float32)
+        # Convert to NumPy array (float32); timestamps as float for homogeneity
+        data_raw = df.to_numpy(dtype=np.float32)
 
         # Column index mapping for convenience
         self.col_index = {name: i for i, name in enumerate(self.columns)}
@@ -56,17 +56,18 @@ class SingleStockDataset:
         # Pre-compute per-column normalization statistics using NaN-aware ops
         # Use population std (unbiased=False) and guard against zeros
         # Keep both vector forms and per-column dicts
-        mean_vec = torch.nanmean(data_raw, dim=0)
-        std_vec = torch.nanstd(data_raw, dim=0, unbiased=False)
-        std_vec = torch.clamp(std_vec, min=1e-8)
+        mean_vec = np.nanmean(data_raw, axis=0).astype(np.float32)
+        # population std (ddof=0)
+        std_vec = np.nanstd(data_raw, axis=0, ddof=0).astype(np.float32)
+        std_vec = np.maximum(std_vec, 1e-8).astype(np.float32)
 
         # Store vector stats for multi-column normalization
-        self._mean_vec: torch.Tensor = mean_vec
-        self._std_vec: torch.Tensor = std_vec
+        self._mean_vec: np.ndarray = mean_vec
+        self._std_vec: np.ndarray = std_vec
 
         # Store per-column stats as dict of scalars for single-column ops
-        self.mean = {col: mean_vec[i].clone() for col, i in self.col_index.items()}
-        self.std = {col: std_vec[i].clone() for col, i in self.col_index.items()}
+        self.mean = {col: float(mean_vec[i]) for col, i in self.col_index.items()}
+        self.std = {col: float(std_vec[i]) for col, i in self.col_index.items()}
 
         # Normalize data immediately and keep both raw and normalized versions
         self._data_raw = data_raw
@@ -220,7 +221,7 @@ class SingleStockDataset:
     
 
     # --- Normalization helpers ---
-    def normalize(self, data: torch.Tensor, column_name: Optional[str] = None) -> torch.Tensor:
+    def normalize(self, data: np.ndarray, column_name: Optional[str] = None) -> np.ndarray:
         """Normalize data using dataset mean/std.
 
         - If column_name is None: expects shape (..., num_columns) and broadcasts
@@ -228,25 +229,25 @@ class SingleStockDataset:
         - If column_name is provided: expects shape [N, M] where N is batch size
           and M is number of time points (days). Uses scalar stats for that column.
         """
-        if not isinstance(data, torch.Tensor):
-            raise TypeError("data must be a torch.Tensor")
+        if not isinstance(data, np.ndarray):
+            raise TypeError("data must be a numpy.ndarray")
 
         if column_name is None:
-            m = self._mean_vec.to(device=data.device, dtype=data.dtype)
-            s = self._std_vec.to(device=data.device, dtype=data.dtype)
+            m = self._mean_vec.astype(data.dtype, copy=False)
+            s = self._std_vec.astype(data.dtype, copy=False)
             return (data - m) / s
         else:
             if column_name not in self.col_index:
                 raise KeyError(f"Unknown column: {column_name}. Available: {self.columns}")
-            if data.dim() != 2:
+            if data.ndim != 2:
                 raise ValueError(
                     f"When column_name is provided, data must be 2D [N, M]; got shape {tuple(data.shape)}"
                 )
-            m = self.mean[column_name].to(device=data.device, dtype=data.dtype)
-            s = self.std[column_name].to(device=data.device, dtype=data.dtype)
+            m = np.asarray(self.mean[column_name], dtype=data.dtype)
+            s = np.asarray(self.std[column_name], dtype=data.dtype)
             return (data - m) / s
 
-    def denormalize(self, data: torch.Tensor, column_name: Optional[str] = None) -> torch.Tensor:
+    def denormalize(self, data: np.ndarray, column_name: Optional[str] = None) -> np.ndarray:
         """Invert normalization: x = data * std + mean.
 
         - If column_name is None: accepts shape (..., num_columns) and broadcasts
@@ -254,22 +255,22 @@ class SingleStockDataset:
         - If column_name is provided: expects shape [N, M] where N is batch size
           and M is number of time points (days). Uses scalar stats for that column.
         """
-        if not isinstance(data, torch.Tensor):
-            raise TypeError("data must be a torch.Tensor")
+        if not isinstance(data, np.ndarray):
+            raise TypeError("data must be a numpy.ndarray")
 
         if column_name is None:
-            m = self._mean_vec.to(device=data.device, dtype=data.dtype)
-            s = self._std_vec.to(device=data.device, dtype=data.dtype)
+            m = self._mean_vec.astype(data.dtype, copy=False)
+            s = self._std_vec.astype(data.dtype, copy=False)
             return data * s + m
         else:
             if column_name not in self.col_index:
                 raise KeyError(f"Unknown column: {column_name}. Available: {self.columns}")
-            if data.dim() != 2:
+            if data.ndim != 2:
                 raise ValueError(
                     f"When column_name is provided, data must be 2D [N, M]; got shape {tuple(data.shape)}"
                 )
-            m = self.mean[column_name].to(device=data.device, dtype=data.dtype)
-            s = self.std[column_name].to(device=data.device, dtype=data.dtype)
+            m = np.asarray(self.mean[column_name], dtype=data.dtype)
+            s = np.asarray(self.std[column_name], dtype=data.dtype)
             return data * s + m
 
     # --- Timestamp index lookup ---
@@ -304,7 +305,7 @@ class SingleStockDataset:
             return int(np.nonzero(mask)[0].max())
 
     # --- Accessors respecting normalization and sampling range ---
-    def get_data_at_index(self, index: int) -> torch.Tensor:
+    def get_data_at_index(self, index: int) -> np.ndarray:
         """Return normalized feature vector [num_columns] at dataset row `index`.
 
         Valid indices are 0 <= index < len(self).
@@ -318,3 +319,75 @@ class SingleStockDataset:
         if not (0 <= idx < n):
             raise ValueError(f"Index {idx} out of bounds for dataset of size {n}")
         return self.data[idx]
+
+    # --- Sampling API ---
+    def get_sample(self) -> dict:
+        """
+        Randomly sample an index i such that:
+        i ∈ [sampling_start_index + history_window_size, sampling_end_index - future_window_size)
+
+        Returns a dict with:
+        - sample_data: torch.float32 tensor of shape [history_window_size, num_columns]
+        - future_price: torch.float32 tensor of shape [future_window_size]
+        """
+        # Load window sizes from config.yaml
+        cfg_path = os.path.join("config.yaml")
+        history_window_size = None
+        future_window_size = None
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, "r") as f:
+                    cfg = yaml.safe_load(f) or {}
+                history_window_size = int(cfg.get("history_window_size"))
+                future_window_size = int(cfg.get("future_window_size"))
+            except Exception:
+                pass
+
+        if history_window_size is None or future_window_size is None:
+            raise ValueError("history_window_size and future_window_size must be set in config.yaml")
+
+        # Compute valid sampling range considering previously applied date sampling
+        start_index = int(self._from_idx) + history_window_size
+        end_index_exclusive = int(self._to_idx) - future_window_size
+
+        if start_index >= end_index_exclusive:
+            raise ValueError(
+                "Invalid sampling window: not enough data between sampling_start_date + "
+                f"history_window_size ({start_index}) and sampling_end_date - future_window_size ({end_index_exclusive})."
+            )
+
+        # Randomly choose i in [start_index, end_index_exclusive)
+        i = int(np.random.randint(start_index, end_index_exclusive))
+
+        # Determine which column stores the price
+        price_idx = 0  # default fallback
+        price_candidates = [
+            "avg_price",
+            "price",
+            "close",
+            "adj_close",
+            "adj_close_price",
+        ]
+        for cand in price_candidates:
+            if cand in self.col_index:
+                price_idx = int(self.col_index[cand])
+                break
+        else:
+            # Heuristic: pick the first column containing 'price' (case-insensitive)
+            for col in self.columns:
+                if "price" in str(col).lower():
+                    price_idx = int(self.col_index[col])
+                    break
+
+        # Slice normalized data
+        sample_np = self.data[i - history_window_size : i]
+        future_np = self.data[i : i + future_window_size, price_idx]
+
+        # Convert to torch tensors
+        sample_data = torch.as_tensor(sample_np, dtype=torch.float32)
+        future_price = torch.as_tensor(future_np, dtype=torch.float32)
+
+        return {
+            "sample_data": sample_data,
+            "future_price": future_price,
+        }
