@@ -28,14 +28,6 @@ def parse_args() -> argparse.Namespace:
         default="config.yaml",
         help="Path to config.yaml (default: config.yaml)",
     )
-    parser.add_argument(
-        "--output",
-        default="outputs",
-        help=(
-            "Base output directory (default: outputs); data saved under "
-            "<output>/data and raw under <output>/raw_data"
-        ),
-    )
     return parser.parse_args()
 
 
@@ -48,6 +40,12 @@ def load_config(path: str) -> Dict[str, Any]:
         raise ValueError("config.yaml must define 'stock_start_date'")
     if "stock_end_date" not in cfg:
         raise ValueError("config.yaml must define 'stock_end_date'")
+    output_dir = cfg.get("output_dir")
+    if output_dir is None:
+        raise ValueError("config.yaml must define 'output_dir'")
+    if not isinstance(output_dir, str) or not output_dir.strip():
+        raise ValueError("'output_dir' in config.yaml must be a non-empty string")
+    cfg["output_dir"] = output_dir.strip()
     return cfg
 
 
@@ -346,12 +344,12 @@ def main():
         )
         sys.exit(2)
 
-    # Create output directories
-    base_dir = args.output
+    cfg = load_config(args.config)
+
+    # Create output directories from config
+    base_dir = cfg["output_dir"]
     raw_dir = os.path.join(base_dir, "raw_data")
     os.makedirs(raw_dir, exist_ok=True)
-
-    cfg = load_config(args.config)
 
     symbols: List[str] = [str(s).strip().upper() for s in cfg["stock_symbols"]]
     start_d = parse_date(cfg["stock_start_date"])
@@ -363,6 +361,12 @@ def main():
     any_ok = False
     for idx, sym in enumerate(symbols):
         try:
+            out_path = os.path.join(raw_dir, f"{sym}.csv")
+            if os.path.exists(out_path):
+                print(f"[SKIP] Found existing {out_path}; skipping {sym}.")
+                any_ok = True
+                continue
+
             print(f"[INFO] Fetching prices for {sym} from {start_d} to {end_d} via Alpha Vantage ...")
             hist = fetch_price_history(sym, start_d, end_d, api_key)
             if hist.empty:
@@ -377,7 +381,6 @@ def main():
 
             out_df = build_output_df(sym, hist, eps_series, fcf_series, pbr_series, roe_series)
             # Save final CSV under raw_data/{SYMBOL}.csv as requested
-            out_path = os.path.join(raw_dir, f"{sym}.csv")
             out_df.to_csv(out_path, index=False)
             print(f"[OK] Wrote {len(out_df)} rows to {out_path}")
             any_ok = True
