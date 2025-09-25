@@ -1,7 +1,7 @@
 """Training script for linear trend predictor."""
 import argparse
 import os
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -188,6 +188,9 @@ def main() -> None:
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
     max_num_iters = ensure_positive_int(cfg, "max_num_iters")
+    loss_avg_decay = ensure_float(cfg, "loss_avg_decay")
+    if not (0.0 < loss_avg_decay < 1.0):
+        raise ValueError("'loss_avg_decay' must be in the interval (0, 1)")
 
     maybe_seed = cfg.get("seed")
     if maybe_seed is not None:
@@ -227,6 +230,7 @@ def main() -> None:
 
     model.train()
     data_iter = iter(dataloader)
+    loss_moving_avg: Optional[float] = None
     for step in range(max_num_iters):
         x_batch, y_batch = next(data_iter)
         x_batch = x_batch.to(device=device, dtype=torch.float32)
@@ -235,6 +239,18 @@ def main() -> None:
         x_agg = aggregate_history(x_batch, agg_window_size)
         preds = model(x_agg)
         loss = F.mse_loss(preds, y_batch)
+        target_expectation = y_batch.mean()
+        relative_loss = loss / target_expectation.pow(2)
+
+        loss_value = float(loss.item())
+        relative_loss_value = float(relative_loss.item())
+        if loss_moving_avg is None:
+            loss_moving_avg = loss_value
+        else:
+            loss_moving_avg = (
+                loss_avg_decay * loss_moving_avg
+                + (1.0 - loss_avg_decay) * loss_value
+            )
 
         optimizer.zero_grad()
         loss.backward()
@@ -244,7 +260,9 @@ def main() -> None:
         if (step + 1) % 100 == 0 or step == 0 or step + 1 == max_num_iters:
             current_lr = scheduler.get_last_lr()[0]
             print(
-                f"step={step + 1:06d}, loss={loss.item():.6f}, lr={current_lr:.6e}",
+                f"step={step + 1:06d}, loss={loss_value:.6f}, "
+                f"loss_avg={loss_moving_avg:.6f}, "
+                f"relative_loss={relative_loss_value:.6f}, lr={current_lr:.6e}",
                 flush=True,
             )
 
