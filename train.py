@@ -239,8 +239,8 @@ def main() -> None:
         x_agg = aggregate_history(x_batch, agg_window_size)
         preds = model(x_agg)
         loss = F.mse_loss(preds, y_batch)
-        target_expectation = y_batch.mean()
-        relative_loss = loss / target_expectation.pow(2)
+        naive_loss = torch.mean(y_batch**2)
+        relative_loss = loss / (naive_loss + 1e-8)
 
         loss_value = float(loss.item())
         relative_loss_value = float(relative_loss.item())

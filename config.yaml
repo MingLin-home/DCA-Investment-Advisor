@@ -31,10 +31,10 @@ sampling_end_date: 2025-01-01
 history_window_size: 360
 future_window_size: 180
 agg_windows_size: 30
-train_batch_size: 32
+train_batch_size: 1024
 num_workers: 8
-lr: 1e-4
+lr: 1e-3
 weight_decay: 1e-6
 optimizer: sgd
-max_num_iters: 100000
+max_num_iters: 1000000
 loss_avg_decay: 0.99
