@@ -1,7 +1,7 @@
 """Simple linear-regression forecaster for stored price series.
 
 Running this module loads avg_price data for each configured ticker, fits a
-one-parameter trending line ``k * (T - i) + b`` over the historical window, and
+one-parameter trending line ``k * (i - T) + b`` over the historical window, and
 stores both JSON metrics and a PNG plot per symbol.
 
 Example
@@ -135,7 +135,7 @@ def load_price_series(
 def fit_trend(values: np.ndarray) -> tuple[float, float, float, np.ndarray, np.ndarray]:
     T = values.size
     idx = np.arange(T, dtype=np.float64)
-    x = (T - idx)  # matches specification k * (T - i) + b
+    x = (idx - T)  # matches specification k * (i - T) + b
     A = np.vstack([x, np.ones_like(x)]).T
     params, *_ = np.linalg.lstsq(A, values, rcond=None)
     k, b = params
