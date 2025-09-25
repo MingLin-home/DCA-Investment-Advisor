@@ -49,6 +49,6 @@ train_buy_strategy:
   lr: 1e-8
   weight_decay: 1e-4
   optimizer: sgd
-  max_num_iters: 100000
+  max_num_iters: 1000000
   loss_avg_decay: 0.99
   batch_gain_alpha: 0.5

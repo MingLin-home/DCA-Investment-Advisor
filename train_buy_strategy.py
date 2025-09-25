@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable
 
@@ -41,6 +42,104 @@ def load_config(path: str) -> Dict[str, Any]:
 
 def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def format_seconds(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def checkpoint_iteration_from_path(path: Path) -> int | None:
+    stem = path.stem
+    if not stem.startswith("checkpoint_iter_"):
+        return None
+    suffix = stem.replace("checkpoint_iter_", "", 1)
+    return int(suffix) if suffix.isdigit() else None
+
+
+def load_latest_checkpoint(
+    checkpoint_dir: Path,
+    device: torch.device,
+    buy_W: torch.Tensor,
+    buy_b: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    max_num_iters: int,
+) -> tuple[int, bool]:
+    if not checkpoint_dir.is_dir():
+        return 0, False
+
+    latest: tuple[int, Path] | None = None
+    for path in checkpoint_dir.glob("checkpoint_iter_*.pt"):
+        iteration = checkpoint_iteration_from_path(path)
+        if iteration is None:
+            continue
+        if latest is None or iteration > latest[0]:
+            latest = (iteration, path)
+
+    if latest is None:
+        return 0, False
+
+    iteration, checkpoint_path = latest
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    buy_W_state = checkpoint.get("buy_W")
+    buy_b_state = checkpoint.get("buy_b")
+    optimizer_state = checkpoint.get("optimizer_state")
+
+    if buy_W_state is None or buy_b_state is None or optimizer_state is None:
+        raise ValueError(f"Checkpoint '{checkpoint_path}' is missing required data.")
+
+    buy_W.data.copy_(buy_W_state.to(device))
+    buy_b.data.copy_(buy_b_state.to(device))
+    optimizer.load_state_dict(optimizer_state)
+
+    stored_max_iters = checkpoint.get("max_num_iters")
+    if stored_max_iters is not None and stored_max_iters != max_num_iters:
+        print(
+            f"Warning: checkpoint '{checkpoint_path}' max_num_iters={stored_max_iters} "
+            f"differs from current setting {max_num_iters}."
+        )
+
+    print(f"Loaded checkpoint from iteration {iteration} ({checkpoint_path}).")
+    return iteration, iteration >= max_num_iters
+
+
+def save_checkpoint(
+    checkpoint_dir: Path,
+    iteration: int,
+    buy_W: torch.Tensor,
+    buy_b: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    max_num_iters: int,
+    keep: int = 3,
+) -> None:
+    ensure_directory(checkpoint_dir)
+    checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration:06d}.pt"
+    checkpoint = {
+        "iteration": iteration,
+        "buy_W": buy_W.detach().cpu(),
+        "buy_b": buy_b.detach().cpu(),
+        "optimizer_state": optimizer.state_dict(),
+        "max_num_iters": max_num_iters,
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved checkpoint to {checkpoint_path}.")
+
+    checkpoints: list[tuple[int, Path]] = []
+    for path in checkpoint_dir.glob("checkpoint_iter_*.pt"):
+        iter_idx = checkpoint_iteration_from_path(path)
+        if iter_idx is not None:
+            checkpoints.append((iter_idx, path))
+
+    checkpoints.sort(key=lambda item: item[0], reverse=True)
+    for _, old_path in checkpoints[keep:]:
+        try:
+            old_path.unlink(missing_ok=True)
+            print(f"Removed old checkpoint {old_path}.")
+        except FileNotFoundError:
+            continue
 
 def get_batch_gain(batched_termination_asset_value: torch.Tensor, alpha: float):
     """
@@ -306,6 +405,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     output_dir = Path(cfg.get("output_dir", "./outputs"))
     data_dir = output_dir / "data"
     forecast_dir = output_dir / "forcast"
+    checkpoint_dir = output_dir / "checkpoints"
 
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Stock data directory does not exist: {data_dir}")
@@ -417,8 +517,28 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if max_num_iters <= 0:
         raise ValueError("'max_num_iters' must be a positive integer")
 
-    log_interval = int(get_train_setting("log_interval", max(1, max_num_iters // 10)))
-    log_interval = max(log_interval, 1)
+    log_interval_cfg = get_train_setting("log_interval", None)
+    if log_interval_cfg is None:
+        log_interval_iters = max(1, max_num_iters // 10)
+    else:
+        try:
+            log_interval_value = float(log_interval_cfg)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("'log_interval' must be a numeric value") from exc
+
+        if log_interval_value <= 0:
+            raise ValueError("'log_interval' must be positive")
+
+        if log_interval_value >= 1:
+            rounded = round(log_interval_value)
+            if not math.isclose(log_interval_value, rounded, rel_tol=0.0, abs_tol=1e-9):
+                raise ValueError("'log_interval' must be an integer when it is >= 1")
+            log_interval_iters = int(rounded)
+        else:
+            log_interval_iters = int(round(log_interval_value * max_num_iters))
+            log_interval_iters = max(1, log_interval_iters)
+
+    checkpoint_interval = max(1, int(math.ceil(max_num_iters * 0.01)))
 
     init_std = 1e-6 / math.sqrt(float(num_stocks))
     buy_W = torch.normal(
@@ -453,7 +573,23 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         buy_b,
     ], lr=lr, weight_decay=weight_decay)
 
-    for iteration in range(1, max_num_iters + 1):
+    resume_iteration, final_checkpoint_loaded = load_latest_checkpoint(
+        checkpoint_dir,
+        device,
+        buy_W,
+        buy_b,
+        optimizer,
+        max_num_iters,
+    )
+
+    if resume_iteration > 0 and resume_iteration < max_num_iters:
+        print(f"Resuming training from iteration {resume_iteration}.")
+    if final_checkpoint_loaded:
+        print("Final checkpoint detected; skipping training loop and exporting results.")
+
+    training_start_time = time.time()
+
+    for iteration in range(resume_iteration + 1, max_num_iters + 1):
         price_traj = gen_price_trajectory(
             init_price,
             simulate_time_interval,
@@ -477,14 +613,44 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         loss.backward()
         optimizer.step()
 
-        if iteration % log_interval == 0 or iteration == 1 or iteration == max_num_iters:
+        iterations_completed = iteration - resume_iteration
+        should_log = (
+            iteration == resume_iteration + 1
+            or iteration == max_num_iters
+            or (iteration % log_interval_iters == 0)
+        )
+
+        if should_log:
             with torch.no_grad():
                 mean_val = batched_termination_asset_value.mean().item()
                 std_val = batched_termination_asset_value.std(unbiased=False).item()
+                elapsed_time = max(time.time() - training_start_time, 0.0)
+                if iterations_completed > 0 and elapsed_time > 0:
+                    remaining_iters = max_num_iters - iteration
+                    eta_seconds = (
+                        elapsed_time / iterations_completed
+                    ) * remaining_iters if remaining_iters > 0 else 0.0
+                else:
+                    eta_seconds = float("inf")
+                eta_display = (
+                    format_seconds(eta_seconds)
+                    if math.isfinite(eta_seconds)
+                    else "--:--:--"
+                )
                 print(
                     f"iter={iteration:6d} batch_gain={batch_gain.item(): .6f} "
-                    f"mean={mean_val: .6f} std={std_val: .6f}"
+                    f"mean={mean_val: .6f} std={std_val: .6f} eta={eta_display}"
                 )
+
+        if iteration % checkpoint_interval == 0 or iteration == max_num_iters:
+            save_checkpoint(
+                checkpoint_dir,
+                iteration,
+                buy_W,
+                buy_b,
+                optimizer,
+                max_num_iters,
+            )
 
     buy_W_cpu = buy_W.detach().cpu()
     buy_b_cpu = buy_b.detach().cpu()
