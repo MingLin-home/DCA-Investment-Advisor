@@ -6,8 +6,9 @@ columns:
 
 etf_symbols:
 - QQQ
-# - VGT
-# - QQQ
+- VGT
+- VOO
+
 
 stock_symbols:
 - NVDA
@@ -28,7 +29,10 @@ stock_symbols:
 
 stock_start_date: 2020-01-01
 stock_end_date: 2025-09-25
-# stock_api: yfinance
+
+simple_forecast_history_start_date: 2023-09-25
+simple_forecast_history_end_date: 2025-09-25
+
 sampling_start_date: 2020-01-01
 sampling_end_date: 2025-09-25
 history_window_size: 360

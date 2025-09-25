@@ -99,6 +99,14 @@ def main() -> None:
     if not isinstance(stock_symbols, (list, tuple)) or not stock_symbols:
         raise ValueError("'stock_symbols' must be a non-empty list")
 
+    etf_symbols = cfg.get("etf_symbols", [])
+    if etf_symbols is None:
+        etf_symbols = []
+    if not isinstance(etf_symbols, (list, tuple)):
+        raise ValueError("'etf_symbols' must be a list when provided")
+
+    all_symbols: List[str] = list(dict.fromkeys(list(stock_symbols) + list(etf_symbols)))
+
     start_date = parse_date(str(cfg["stock_start_date"]))
     end_date = parse_date(str(cfg["stock_end_date"]))
     if end_date < start_date:
@@ -107,7 +115,7 @@ def main() -> None:
     output_dir = Path(cfg["output_dir"]).expanduser()
     raw_data_dir = output_dir / "raw_data"
 
-    for symbol in stock_symbols:
+    for symbol in all_symbols:
         symbol_str = str(symbol).strip().upper()
         if not symbol_str:
             continue

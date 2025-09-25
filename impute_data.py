@@ -5,19 +5,18 @@ python impute_data.py \
 
 "--config" is optional. By default, it loads ./config.yaml
 
-It reads all stock symbols in "stock_symbols" in the ./config.yaml.
+It reads all stock symbols in "stock_symbols" and ETF symbols in "etf_symbols" in the ./config.yaml.
 
-For each stock symbol:
-- it reads "avg_price", "date" from <output_dir>/raw_data/<stock_symbol>_price.csv, reads
-- it reads "data" , "EPS" from <output_dir>/raw_data/<stock_symbol>_eps.csv
-- it then combines "date" , "avg_price", "EPS" into a new dataframe and write to <output_dir>/data/<stock_symbol>.csv
-- it add a column "timestamp" which is the unix timestamp in seconds of the "date"
+For each symbol:
+- it reads "avg_price", "date" from <output_dir>/raw_data/<symbol>_price.csv
+- if EPS data exists, it reads "date" , "EPS" from <output_dir>/raw_data/<symbol>_eps.csv
+- it then combines "date" , "avg_price", "EPS" into a new dataframe and writes to <output_dir>/data/<symbol>.csv
+- it adds a column "timestamp" which is the unix timestamp in seconds of the "date"
 
 The "date" should be sorted and continuous. That is, the first row of date must be "stock_start_date", the last row of date must be stock_end_date. For any two row i and (i+1), their timestamp must increase by exactly 24 hours * 3600 seconds / hour.
 Insert a new row if some date is missing.
 
 For "avg_price" and "EPS" column, if value is missing, use the nearest non-missing value to fill the missing value.
-
 '''
 from __future__ import annotations
 
@@ -83,12 +82,20 @@ def parse_date(value: Any, field: str) -> datetime:
         raise ValueError(f"Config key '{field}' must use YYYY-MM-DD format") from exc
 
 
-def normalize_symbols(raw_symbols: Any) -> list[str]:
+def normalize_symbols(raw_symbols: Any, field_name: str, required: bool = True) -> list[str]:
+    if raw_symbols is None:
+        if not required:
+            return []
+        raise ValueError(f"'{field_name}' must be a non-empty list of strings")
+
     if not isinstance(raw_symbols, Iterable) or isinstance(raw_symbols, (str, bytes)):
-        raise ValueError("'stock_symbols' must be a non-empty list of strings")
+        raise ValueError(f"'{field_name}' must be a non-empty list of strings")
+
     symbols = [str(symbol).strip().upper() for symbol in raw_symbols if str(symbol).strip()]
     if not symbols:
-        raise ValueError("No valid stock symbols found in configuration")
+        if required:
+            raise ValueError(f"No valid entries found in '{field_name}' configuration")
+        return []
     return symbols
 
 
@@ -166,12 +173,16 @@ def process_symbol(
     date_index: pd.DatetimeIndex,
     raw_dir: Path,
     data_dir: Path,
+    has_eps: bool = True,
 ) -> bool:
     price_path = raw_dir / f"{symbol}_price.csv"
     eps_path = raw_dir / f"{symbol}_eps.csv"
 
     price_series = read_value_series(price_path, "avg_price")
-    eps_series = read_value_series(eps_path, "EPS")
+    if has_eps:
+        eps_series = read_value_series(eps_path, "EPS")
+    else:
+        eps_series = pd.Series(dtype=float)
 
     if price_series.empty and eps_series.empty:
         LOGGER.warning("No data available for %s; skipping", symbol)
@@ -194,7 +205,13 @@ def main() -> None:
     cfg = load_config(cfg_path)
     ensure_required_keys(cfg, ["stock_symbols", "stock_start_date", "stock_end_date", "output_dir"])
 
-    symbols = normalize_symbols(cfg["stock_symbols"])
+    stock_symbols = normalize_symbols(cfg["stock_symbols"], "stock_symbols")
+    etf_symbols = normalize_symbols(cfg.get("etf_symbols"), "etf_symbols", required=False)
+    symbol_has_eps: dict[str, bool] = {}
+    for symbol in stock_symbols:
+        symbol_has_eps.setdefault(symbol, True)
+    for symbol in etf_symbols:
+        symbol_has_eps.setdefault(symbol, False)  # keep stock preference if symbol overlaps
     start_date = parse_date(cfg["stock_start_date"], "stock_start_date")
     end_date = parse_date(cfg["stock_end_date"], "stock_end_date")
     if end_date < start_date:
@@ -207,9 +224,9 @@ def main() -> None:
     data_dir = output_root / "data"
 
     any_success = False
-    for symbol in symbols:
+    for symbol, has_eps in symbol_has_eps.items():
         try:
-            if process_symbol(symbol, cfg, date_index, raw_dir, data_dir):
+            if process_symbol(symbol, cfg, date_index, raw_dir, data_dir, has_eps=has_eps):
                 any_success = True
         except Exception as exc:
             LOGGER.error("Failed to process %s: %s", symbol, exc)
