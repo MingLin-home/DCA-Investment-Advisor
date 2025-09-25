@@ -240,7 +240,7 @@ def forecast_prices(
     if not stock_end_date:
         raise ValueError("config must define non-empty 'stock_end_date'")
 
-    forecast_dir = os.path.join(output_dir, "forcast")
+    forecast_dir = os.path.join(output_dir, "forecast")
     os.makedirs(forecast_dir, exist_ok=True)
 
     for dataset in datasets:
@@ -334,7 +334,7 @@ def main() -> None:
 
     output_dir = cfg.get("output_dir", "./outputs")
     output_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
-    save_dir = os.path.join(output_dir, "save_model")
+    save_dir = os.path.join(output_dir, "train_price_model")
     os.makedirs(save_dir, exist_ok=True)
 
     final_path = os.path.join(save_dir, "model.npz")
