@@ -160,10 +160,10 @@ def ensure_float(cfg: Dict[str, Any], key: str) -> float:
         raise ValueError(f"Configuration key '{key}' must be a float") from exc
 
 
-def build_datasets(stock_symbols: Sequence[str]) -> List[SingleStockDataset]:
+def build_datasets(stock_symbols: Sequence[str], cfg: Dict[str, Any]) -> List[SingleStockDataset]:
     datasets: List[SingleStockDataset] = []
     for symbol in stock_symbols:
-        datasets.append(SingleStockDataset(symbol))
+        datasets.append(SingleStockDataset(symbol, cfg))
     return datasets
 
 
@@ -181,10 +181,12 @@ def aggregate_history(x: torch.Tensor, agg_window_size: int) -> torch.Tensor:
     return torch.cat((x_mean, x_std), dim=1)
 
 
-def create_optimizer(model: LinearTrendModel, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
-    lr = ensure_float(cfg, "lr")
-    weight_decay = ensure_float(cfg, "weight_decay")
-    optimizer_name = str(cfg.get("optimizer", "sgd")).strip().lower()
+def create_optimizer(
+    model: LinearTrendModel, train_cfg: Dict[str, Any]
+) -> torch.optim.Optimizer:
+    lr = ensure_float(train_cfg, "lr")
+    weight_decay = ensure_float(train_cfg, "weight_decay")
+    optimizer_name = str(train_cfg.get("optimizer", "sgd")).strip().lower()
 
     if optimizer_name == "sgd":
         return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -301,6 +303,10 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
 
+    train_cfg = cfg.get("train_price_model")
+    if not isinstance(train_cfg, dict):
+        raise ValueError("config must provide a mapping under 'train_price_model'")
+
     stock_symbols = cfg.get("stock_symbols")
     if not isinstance(stock_symbols, list) or not stock_symbols:
         raise ValueError("config must provide a non-empty list under 'stock_symbols'")
@@ -318,8 +324,8 @@ def main() -> None:
     num_workers = int(cfg.get("num_workers", 0))
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
-    max_num_iters = ensure_positive_int(cfg, "max_num_iters")
-    loss_avg_decay = ensure_float(cfg, "loss_avg_decay")
+    max_num_iters = ensure_positive_int(train_cfg, "max_num_iters")
+    loss_avg_decay = ensure_float(train_cfg, "loss_avg_decay")
     if not (0.0 < loss_avg_decay < 1.0):
         raise ValueError("'loss_avg_decay' must be in the interval (0, 1)")
 
@@ -339,7 +345,7 @@ def main() -> None:
 
     final_path = os.path.join(save_dir, "model.npz")
 
-    datasets = build_datasets(stock_symbols)
+    datasets = build_datasets(stock_symbols, cfg)
 
     model = LinearTrendModel(feature_dim)
     weight_np: Optional[np.ndarray] = None
@@ -363,7 +369,7 @@ def main() -> None:
             pin_memory=False,
         )
 
-        optimizer = create_optimizer(model, cfg)
+        optimizer = create_optimizer(model, train_cfg)
         scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1.0,

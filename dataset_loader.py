@@ -1,9 +1,8 @@
 import os
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import yaml
 """
 This module uses NumPy arrays exclusively. PyTorch tensors are not used.
 """
@@ -13,35 +12,39 @@ class SingleStockDataset:
     def __init__(
         self,
         stock_symbol: str,
+        cfg: Dict[str, Any],
     ) -> None:
         """
         Loads stock CSV data into a NumPy array of shape (num_rows, num_columns).
 
-        - CSV path: ./outputs/data/<stock_symbol>.csv
-        - Columns are read from config.yaml under the key 'columns'.
+        - CSV path: <cfg['output_dir']>/data/<stock_symbol>.csv
+        - Columns are read from cfg['columns'].
         - self.data[:, 0] = avg_price, etc.
         """
 
         self.stock_symbol: str = stock_symbol
 
-        # Load config (once) to fetch columns and later sampling settings
-        self.cfg = {}
-        cfg_path = os.path.join("config.yaml")
-        if os.path.isfile(cfg_path):
-            try:
-                with open(cfg_path, "r") as f:
-                    self.cfg = yaml.safe_load(f) or {}
-            except Exception:
-                self.cfg = {}
+        if cfg is None:
+            raise ValueError("cfg must be provided for SingleStockDataset")
+        if not isinstance(cfg, dict):
+            raise TypeError("cfg must be a mapping of configuration values")
 
-        # Read columns from config.yaml
-        cfg_columns = (self.cfg or {}).get("columns")
+        # Make a shallow copy so internal mutations don't affect caller state.
+        self.cfg: Dict[str, Any] = dict(cfg)
+
+        output_dir = self.cfg.get("output_dir")
+        if output_dir is None or str(output_dir).strip() == "":
+            raise ValueError("config must define a non-empty 'output_dir'")
+        self._output_root = os.path.abspath(os.path.expanduser(str(output_dir)))
+
+        # Read columns from provided config mapping.
+        cfg_columns = self.cfg.get("columns")
         if not isinstance(cfg_columns, list) or not cfg_columns or not all(isinstance(c, str) for c in cfg_columns):
-            raise ValueError("config.yaml must define 'columns' as a non-empty list of strings")
+            raise ValueError("config must define 'columns' as a non-empty list of strings")
         self.columns: List[str] = list(cfg_columns)
 
         # Load CSV
-        csv_path = os.path.join("outputs", "data", f"{stock_symbol}.csv")
+        csv_path = os.path.join(self._output_root, "data", f"{stock_symbol}.csv")
         if not os.path.isfile(csv_path):
             raise FileNotFoundError(f"CSV not found: {csv_path}")
 
@@ -136,7 +139,7 @@ class SingleStockDataset:
 
     # --- Config helpers ---
     def _apply_sampling_range_from_config(self) -> None:
-        """If config.yaml defines sampling_start_date/end_date, apply date range.
+        """If config defines sampling_start_date/end_date, apply date range.
 
         Supported values per key:
         - 'YYYY-MM-DD' (ISO) or None/empty to ignore that bound.
@@ -356,7 +359,7 @@ class SingleStockDataset:
             history_window_size = int(cfg.get("history_window_size"))
             future_window_size = int(cfg.get("future_window_size"))
         except Exception as e:
-            raise ValueError("history_window_size and future_window_size must be set in config.yaml") from e
+            raise ValueError("history_window_size and future_window_size must be set in config") from e
 
         # Compute valid sampling range considering previously applied date sampling
         start_index = int(self._from_idx) + history_window_size
