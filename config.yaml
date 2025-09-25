@@ -36,5 +36,5 @@ num_workers: 8
 lr: 1e-3
 weight_decay: 1e-6
 optimizer: sgd
-max_num_iters: 1000000
+max_num_iters: 100000
 loss_avg_decay: 0.99

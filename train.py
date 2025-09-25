@@ -97,6 +97,13 @@ class LinearTrendModel(torch.nn.Module):
         return x @ self.weight + self.bias
 
 
+def save_model_npz(model: LinearTrendModel, path: str) -> None:
+    """Persist model parameters as NumPy arrays."""
+    weight_np = model.weight.detach().cpu().numpy()
+    bias_np = model.bias.detach().cpu().numpy().reshape(1, 3)
+    np.savez(path, W=weight_np, b=bias_np)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train linear trend model")
     parser.add_argument(
@@ -228,6 +235,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    output_dir = cfg.get("output_dir", "./outputs")
+    output_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
+    save_dir = os.path.join(output_dir, "save_model")
+    os.makedirs(save_dir, exist_ok=True)
+
+    next_print_fraction = 0.001
+    next_save_fraction = 0.01
+    fraction_eps = 1e-12
+    checkpoint_paths: List[str] = []
+
     model.train()
     data_iter = iter(dataloader)
     loss_moving_avg: Optional[float] = None
@@ -257,27 +274,44 @@ def main() -> None:
         optimizer.step()
         scheduler.step()
 
-        if (step + 1) % 100 == 0 or step == 0 or step + 1 == max_num_iters:
+        step_idx = step + 1
+        progress = step_idx / max_num_iters
+
+        should_print = step == 0 or step_idx == max_num_iters
+        # Advance logging thresholds so we emit once per 0.1% of progress even if a step covers multiple thresholds.
+        while progress + fraction_eps >= next_print_fraction and next_print_fraction <= 1.0:
+            should_print = True
+            next_print_fraction += 0.001
+
+        if should_print:
             current_lr = scheduler.get_last_lr()[0]
             print(
-                f"step={step + 1:06d}, loss={loss_value:.6f}, "
+                f"step={step_idx:06d}, loss={loss_value:.6f}, "
                 f"loss_avg={loss_moving_avg:.6f}, "
                 f"relative_loss={relative_loss_value:.6f}, lr={current_lr:.6e}",
                 flush=True,
             )
 
-    model_cpu = model.to("cpu")
-    weight_np = model_cpu.weight.detach().numpy()
-    bias_np = model_cpu.bias.detach().numpy().reshape(1, 3)
+        should_save = step_idx == max_num_iters
+        # Advance saving thresholds so checkpoints align with every 1% of progress.
+        while progress + fraction_eps >= next_save_fraction and next_save_fraction <= 1.0:
+            should_save = True
+            next_save_fraction += 0.01
 
-    output_dir = cfg.get("output_dir", "./outputs")
-    output_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
-    save_dir = os.path.join(output_dir, "save_model")
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, "model.npz")
+        if should_save:
+            checkpoint_path = os.path.join(save_dir, f"model_step_{step_idx:06d}.npz")
+            save_model_npz(model, checkpoint_path)
+            checkpoint_paths.append(checkpoint_path)
+            if len(checkpoint_paths) > 5:
+                oldest_path = checkpoint_paths.pop(0)
+                try:
+                    os.remove(oldest_path)
+                except OSError as exc:
+                    print(f"Warning: failed to remove old checkpoint {oldest_path}: {exc}", flush=True)
 
-    np.savez(save_path, W=weight_np, b=bias_np)
-    print(f"Model parameters saved to {save_path}")
+    final_path = os.path.join(save_dir, "model.npz")
+    save_model_npz(model, final_path)
+    print(f"Model parameters saved to {final_path}")
 
 
 if __name__ == "__main__":
