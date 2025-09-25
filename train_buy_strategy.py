@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Iterable
 
-import yaml
+import numpy as np
+import pandas as pd
 import torch
+import yaml
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -32,6 +36,10 @@ def load_config(path: str) -> Dict[str, Any]:
         raise ValueError("Configuration file must contain a top-level mapping of settings.")
 
     return cfg
+
+
+def ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 def get_batch_gain(batched_termination_asset_value: torch.Tensor, alpha: float):
     """
@@ -219,11 +227,226 @@ def gen_price_trajectory(init_price: torch.Tensor, simulate_time_interval: int, 
     trajectory = torch.clamp(trajectory, min=0.01)
     return trajectory
 
+
+def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available() and cfg.get("use_cuda", True)
+        else "cpu"
+    )
+
+    seed = cfg.get("seed")
+    if seed is not None:
+        torch.manual_seed(int(seed))
+
+    stock_symbols = cfg.get("stock_symbols")
+    if isinstance(stock_symbols, str):
+        stock_symbols = [stock_symbols]
+    if not isinstance(stock_symbols, Iterable) or not stock_symbols:
+        raise ValueError("Configuration must define a non-empty 'stock_symbols' list")
+
+    symbols = tuple(str(sym) for sym in stock_symbols)
+
+    output_dir = Path(cfg.get("output_dir", "./outputs"))
+    data_dir = output_dir / "data"
+    forecast_dir = output_dir / "forcast"
+
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Stock data directory does not exist: {data_dir}")
+    if not forecast_dir.is_dir():
+        raise FileNotFoundError(f"Forecast directory does not exist: {forecast_dir}")
+
+    end_date_cfg = cfg.get("stock_end_date")
+    if not end_date_cfg:
+        raise ValueError("Configuration must define 'stock_end_date'")
+    end_date = pd.to_datetime(end_date_cfg).date()
+
+    init_prices = []
+    k_values = []
+    b_values = []
+    std_values = []
+
+    for symbol in symbols:
+        csv_path = data_dir / f"{symbol}.csv"
+        if not csv_path.is_file():
+            raise FileNotFoundError(f"Missing price file for symbol '{symbol}': {csv_path}")
+
+        df = pd.read_csv(csv_path)
+        if "date" not in df.columns or "avg_price" not in df.columns:
+            raise ValueError(
+                f"Price file '{csv_path}' must contain 'date' and 'avg_price' columns"
+            )
+
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        price_row = df.loc[df["date"] == end_date, "avg_price"]
+        if price_row.empty:
+            raise ValueError(
+                f"Could not find price for symbol '{symbol}' on {end_date} in {csv_path}"
+            )
+
+        init_prices.append(float(price_row.iloc[-1]))
+
+        forecast_path = forecast_dir / f"{symbol}.json"
+        if not forecast_path.is_file():
+            raise FileNotFoundError(
+                f"Missing forecast file for symbol '{symbol}': {forecast_path}"
+            )
+
+        with forecast_path.open("r", encoding="utf-8") as f:
+            forecast_data = json.load(f)
+
+        try:
+            k_values.append(float(forecast_data["pred_k"]))
+            b_values.append(float(forecast_data["pred_b"]))
+            std_values.append(float(forecast_data["pred_std"]))
+        except KeyError as exc:
+            raise KeyError(
+                f"Forecast file '{forecast_path}' missing required field: {exc}"
+            ) from exc
+
+    init_price = torch.tensor(init_prices, dtype=torch.float32, device=device)
+    k_vector = torch.tensor(k_values, dtype=torch.float32, device=device)
+    b_vector = torch.tensor(b_values, dtype=torch.float32, device=device)
+    std_vector = torch.tensor(std_values, dtype=torch.float32, device=device)
+
+    num_stocks = init_price.shape[0]
+    if num_stocks == 0:
+        raise ValueError("At least one stock is required for training")
+
+    simulation_batch_size = int(cfg.get("simulation_batch_size", 128))
+    if simulation_batch_size <= 0:
+        raise ValueError("'simulation_batch_size' must be a positive integer")
+
+    simulation_T = int(cfg.get("simulation_T", 6))
+    if simulation_T <= 0:
+        raise ValueError("'simulation_T' must be a positive integer")
+
+    simulate_time_interval = int(cfg.get("simulate_time_interval", 1))
+    simulate_time_interval = max(simulate_time_interval, 1)
+
+    lr = float(cfg.get("lr", 1e-3))
+    weight_decay = float(cfg.get("weight_decay", 0.0))
+    alpha = float(cfg.get("batch_gain_alpha", 0.1))
+    if alpha <= 0:
+        raise ValueError("'batch_gain_alpha' must be a positive float")
+
+    max_num_iters = int(cfg.get("max_num_iters", 1000))
+    if max_num_iters <= 0:
+        raise ValueError("'max_num_iters' must be a positive integer")
+
+    log_interval = int(cfg.get("log_interval", max(1, max_num_iters // 10)))
+    log_interval = max(log_interval, 1)
+
+    buy_W = torch.zeros((num_stocks, num_stocks), dtype=torch.float32, device=device, requires_grad=True)
+    buy_b = torch.zeros(num_stocks, dtype=torch.float32, device=device, requires_grad=True)
+
+    optimizer = torch.optim.SGD([
+        buy_W,
+        buy_b,
+    ], lr=lr, weight_decay=weight_decay)
+
+    for iteration in range(1, max_num_iters + 1):
+        termination_values = []
+        for _ in range(simulation_batch_size):
+            price_traj = gen_price_trajectory(
+                init_price,
+                simulate_time_interval,
+                k_vector,
+                b_vector,
+                std_vector,
+                simulation_T,
+            )
+            buy_strategy = get_buy_strategy(price_traj, buy_W, buy_b)
+            termination_value = get_termination_asset_value(price_traj, buy_strategy)
+            termination_values.append(termination_value)
+
+        batched_termination_asset_value = torch.stack(termination_values)
+        batch_gain = get_batch_gain(batched_termination_asset_value, alpha)
+
+        loss = -batch_gain
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if iteration % log_interval == 0 or iteration == 1 or iteration == max_num_iters:
+            with torch.no_grad():
+                mean_val = batched_termination_asset_value.mean().item()
+                std_val = batched_termination_asset_value.std(unbiased=False).item()
+                print(
+                    f"iter={iteration:6d} batch_gain={batch_gain.item(): .6f} "
+                    f"mean={mean_val: .6f} std={std_val: .6f}"
+                )
+
+    buy_W_cpu = buy_W.detach().cpu()
+    buy_b_cpu = buy_b.detach().cpu()
+    init_price_cpu = init_price.detach().cpu()
+    k_vector_cpu = k_vector.detach().cpu()
+    b_vector_cpu = b_vector.detach().cpu()
+    std_vector_cpu = std_vector.detach().cpu()
+
+    with torch.no_grad():
+        deterministic_price_traj = gen_price_trajectory(
+            init_price,
+            simulate_time_interval,
+            k_vector,
+            b_vector,
+            torch.zeros_like(std_vector),
+            simulation_T,
+        )
+        buy_strategy_now = get_buy_strategy(deterministic_price_traj, buy_W, buy_b)
+
+        shares_held = buy_strategy_now / deterministic_price_traj
+        total_shares = shares_held.sum(dim=1)
+        final_prices = deterministic_price_traj[:, -1]
+        termination_stock_value = float((total_shares * final_prices).sum().item())
+        cash_spent = float(buy_strategy_now.sum().item())
+        termination_cash_value = float(1.0 - cash_spent)
+        penalty = max(cash_spent - 1.0, 0.0) * 1000.0
+        termination_total_asset_value = termination_stock_value + termination_cash_value - penalty
+
+        per_stock_action = {
+            symbol: float(buy_strategy_now[idx, 0].item())
+            for idx, symbol in enumerate(symbols)
+        }
+
+    return {
+        "buy_W": buy_W_cpu.numpy(),
+        "buy_b": buy_b_cpu.numpy(),
+        "init_price": init_price_cpu.numpy(),
+        "k_vector": k_vector_cpu.numpy(),
+        "b_vector": b_vector_cpu.numpy(),
+        "std_vector": std_vector_cpu.numpy(),
+        "symbols": symbols,
+        "buy_action": {
+            **per_stock_action,
+            "termination_stock_value": float(termination_stock_value),
+            "termination_cash_value": float(termination_cash_value),
+            "termination_total_asset_value": float(termination_total_asset_value),
+        },
+    }
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
-    # The cfg variable is intentionally kept within main for further use.
     print(f"Loaded configuration with {len(cfg)} top-level keys from '{args.config}'.")
+
+    training_artifacts = run_training(cfg)
+
+    output_dir = Path(cfg.get("output_dir", "./outputs"))
+    ensure_directory(output_dir)
+
+    buy_traj_path = output_dir / "buy_trajectory.npz"
+    np.savez(
+        buy_traj_path,
+        buy_W=training_artifacts["buy_W"],
+        buy_b=training_artifacts["buy_b"],
+    )
+    print(f"Saved buy parameters to '{buy_traj_path}'.")
+
+    buy_action_path = output_dir / "buy_action_now.json"
+    with buy_action_path.open("w", encoding="utf-8") as f:
+        json.dump(training_artifacts["buy_action"], f, indent=2)
+    print(f"Saved buy action recommendation to '{buy_action_path}'.")
 
 
 if __name__ == "__main__":
