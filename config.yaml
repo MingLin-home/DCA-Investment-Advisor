@@ -38,3 +38,4 @@ weight_decay: 1e-6
 optimizer: sgd
 max_num_iters: 100000
 loss_avg_decay: 0.99
+simulate_time_interval: 30
