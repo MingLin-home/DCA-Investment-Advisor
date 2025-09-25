@@ -56,25 +56,28 @@ def get_batch_gain(batched_termination_asset_value: torch.Tensor, alpha: float):
 def get_termination_asset_value(
     price_trajectory: torch.Tensor,
     buy_strategy: torch.Tensor,
-    penalty_factor: float | int = 1.0,
+    overbuy_penalty_factor: float | int = 1.0,
+    sell_penalty_factor: float | int = 1.0,
 ): 
     """
-    penalty_factor: non-negative scalar scaling the overspending penalty.
-    
+    overbuy_penalty_factor: non-negative scalar scaling the overspending penalty.
+    sell_penalty_factor: non-negative scalar scaling the penalty for selling.
+
     price_trajectory: tensor of shape (M, T) or (B, M, T).
       price_trajectory[i, t] (or price_trajectory[b, i, t]) is the price of the i-th stock at time t.
     buy_strategy: tensor of shape (M, T) or (B, M, T) matching price_trajectory.
-    
+
     Return:
     termination_asset_value: total money I have at time t=T-1 for each trajectory, computed by
       Y = torch.sum(torch.sum(buy_strategy / price_trajectory, dim=-1) * price_trajectory[..., -1], dim=-1)
         + 1 - torch.sum(buy_strategy, dim=(-2, -1))
     price_trajectory is guaranteed to be positive.
-    penalty = torch.clamp(
+    overbuy_penalty = torch.clamp(
         torch.sum(buy_strategy, dim=(-2, -1)) - 1,
         min=0,
-    ) * penalty_factor
-    termination_asset_value = Y - penalty
+    ) * overbuy_penalty_factor
+    sell_penalty = (-buy_strategy.clamp(max=0)).sum(dim=[-1, -2]) * sell_penalty_factor
+    termination_asset_value = Y - overbuy_penalty - sell_penalty
 
     """
     tensors = {
@@ -126,9 +129,12 @@ def get_termination_asset_value(
     cash_remaining = ones - spent
     raw_value = portfolio_value + cash_remaining
 
-    penalty_factor_tensor = ones.new_tensor(float(penalty_factor))
-    overbuy_penalty = torch.clamp(spent - ones, min=0) * penalty_factor_tensor
-    sell_penalty = (-buy_strategy.clamp(max=0)).sum(dim=[-1,-2]) * penalty_factor_tensor
+    overbuy_penalty_factor_tensor = ones.new_tensor(float(overbuy_penalty_factor))
+    sell_penalty_factor_tensor = ones.new_tensor(float(sell_penalty_factor))
+    overbuy_penalty = torch.clamp(spent - ones, min=0) * overbuy_penalty_factor_tensor
+    sell_penalty = (
+        -buy_strategy.clamp(max=0)
+    ).sum(dim=[-1, -2]) * sell_penalty_factor_tensor
     termination_asset_value = raw_value - overbuy_penalty - sell_penalty
 
     if original_ndim == 2:
@@ -390,9 +396,22 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if alpha <= 0:
         raise ValueError("'batch_gain_alpha' must be a positive float")
 
-    penalty_factor = float(get_train_setting("penalty_factor", 1.0))
-    if penalty_factor < 0:
-        raise ValueError("'penalty_factor' must be a non-negative float")
+    overbuy_penalty_cfg = get_train_setting("overbuy_penalty_factor", None)
+    sell_penalty_cfg = get_train_setting("sell_penalty_factor", None)
+    legacy_penalty_cfg = get_train_setting("penalty_factor", None)
+
+    if overbuy_penalty_cfg is None:
+        overbuy_penalty_cfg = legacy_penalty_cfg if legacy_penalty_cfg is not None else 1.0
+    if sell_penalty_cfg is None:
+        sell_penalty_cfg = legacy_penalty_cfg if legacy_penalty_cfg is not None else 1.0
+
+    overbuy_penalty_factor = float(overbuy_penalty_cfg)
+    sell_penalty_factor = float(sell_penalty_cfg)
+
+    if overbuy_penalty_factor < 0:
+        raise ValueError("'overbuy_penalty_factor' must be a non-negative float")
+    if sell_penalty_factor < 0:
+        raise ValueError("'sell_penalty_factor' must be a non-negative float")
 
     max_num_iters = int(get_train_setting("max_num_iters", 1000))
     if max_num_iters <= 0:
@@ -448,7 +467,8 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         batched_termination_asset_value = get_termination_asset_value(
             price_traj,
             buy_strategy,
-            penalty_factor,
+            overbuy_penalty_factor,
+            sell_penalty_factor,
         )
         batch_gain = get_batch_gain(batched_termination_asset_value, alpha)
 
@@ -490,8 +510,16 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         termination_stock_value = float((total_shares * final_prices).sum().item())
         cash_spent = float(buy_strategy_now.sum().item())
         termination_cash_value = float(1.0 - cash_spent)
-        penalty = max(cash_spent - 1.0, 0.0) * penalty_factor
-        termination_total_asset_value = termination_stock_value + termination_cash_value - penalty
+        overbuy_penalty_value = max(cash_spent - 1.0, 0.0) * overbuy_penalty_factor
+        sell_penalty_value = (
+            -buy_strategy_now.clamp(max=0)
+        ).sum().item() * sell_penalty_factor
+        termination_total_asset_value = (
+            termination_stock_value
+            + termination_cash_value
+            - overbuy_penalty_value
+            - sell_penalty_value
+        )
 
         per_stock_action = {
             symbol: float(buy_strategy_now[idx, 0].item())
@@ -512,7 +540,8 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         stochastic_termination_asset = get_termination_asset_value(
             stochastic_price_traj,
             stochastic_buy_strategy,
-            penalty_factor,
+            overbuy_penalty_factor,
+            sell_penalty_factor,
         )
 
         stochastic_buy_strategy_cpu = stochastic_buy_strategy.detach().cpu()
