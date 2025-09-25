@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -126,8 +127,9 @@ def get_termination_asset_value(
     raw_value = portfolio_value + cash_remaining
 
     penalty_factor_tensor = ones.new_tensor(float(penalty_factor))
-    penalty = torch.clamp(spent - ones, min=0) * penalty_factor_tensor
-    termination_asset_value = raw_value - penalty
+    overbuy_penalty = torch.clamp(spent - ones, min=0) * penalty_factor_tensor
+    sell_penalty = (-buy_strategy.clamp(max=0)).sum(dim=[-1,-2]) * penalty_factor_tensor
+    termination_asset_value = raw_value - overbuy_penalty - sell_penalty
 
     if original_ndim == 2:
         return termination_asset_value.squeeze(0)
@@ -185,7 +187,7 @@ def get_buy_strategy(price_trajectory: torch.Tensor, buy_W: torch.Tensor, buy_b:
     else:
         z = torch.einsum("ij,bjt->bit", buy_W, price_trajectory) + buy_b.view(1, -1, 1)
 
-    buy_strategy = torch.sigmoid(z)
+    buy_strategy = z
     return buy_strategy
 
 def gen_price_trajectory(
@@ -399,8 +401,23 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     log_interval = int(get_train_setting("log_interval", max(1, max_num_iters // 10)))
     log_interval = max(log_interval, 1)
 
-    buy_W = torch.zeros((num_stocks, num_stocks), dtype=torch.float32, device=device, requires_grad=True)
-    buy_b = torch.zeros(num_stocks, dtype=torch.float32, device=device, requires_grad=True)
+    init_std = 1e-6 / math.sqrt(float(num_stocks))
+    buy_W = torch.normal(
+        mean=0.0,
+        std=init_std,
+        size=(num_stocks, num_stocks),
+        device=device,
+        dtype=torch.float32,
+    )
+    buy_W.requires_grad_()
+    buy_b = torch.normal(
+        mean=0.0,
+        std=init_std,
+        size=(num_stocks,),
+        device=device,
+        dtype=torch.float32,
+    )
+    buy_b.requires_grad_()
 
     optimizer_name = str(get_train_setting("optimizer", "sgd")).strip().lower()
     if optimizer_name == "sgd":
