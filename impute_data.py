@@ -1,295 +1,226 @@
-#!/usr/bin/env python3
+'''
+Usage:
+python impute_data.py \
+    --config ./config.yaml
+
+"--config" is optional. By default, it loads ./config.yaml
+
+It reads all stock symbols in "stock_symbols" in the ./config.yaml.
+
+For each stock symbol:
+- it reads "avg_price", "date" from <output_dir>/raw_data/<stock_symbol>_price.csv, reads
+- it reads "data" , "EPS" from <output_dir>/raw_data/<stock_symbol>_eps.csv
+- it then combines "date" , "avg_price", "EPS" into a new dataframe and write to <output_dir>/data/<stock_symbol>.csv
+- it add a column "timestamp" which is the unix timestamp in seconds of the "date"
+
+The "date" should be sorted and continuous. That is, the first row of date must be "stock_start_date", the last row of date must be stock_end_date. For any two row i and (i+1), their timestamp must increase by exactly 24 hours * 3600 seconds / hour.
+Insert a new row if some date is missing.
+
+For "avg_price" and "EPS" column, if value is missing, use the nearest non-missing value to fill the missing value.
+
+'''
+from __future__ import annotations
+
 import argparse
-import os
+import logging
 import sys
-from datetime import date, datetime, timedelta, timezone
-from typing import Iterable, List, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
 
 import pandas as pd
 import yaml
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Impute daily rows for each symbol, ensuring 24h steps and "
-            "filling missing numeric values via linear interpolation/extrapolation."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Impute stock price and EPS data")
     parser.add_argument(
         "--config",
         default="config.yaml",
-        help="Path to config.yaml (default: config.yaml)",
+        help="Path to YAML config file (default: config.yaml)",
     )
     parser.add_argument(
-        "--output",
-        default=None,
-        help=(
-            "Optional override for base output directory. When omitted, the value "
-            "from config.yaml (output_dir) is used."
-        ),
+        "--quiet",
+        action="store_true",
+        help="Suppress informational log messages",
     )
     return parser.parse_args()
 
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+def configure_logging(quiet: bool) -> None:
+    level = logging.WARNING if quiet else logging.INFO
+    logging.basicConfig(format="[%(levelname)s] %(message)s", level=level)
 
-    if "stock_symbols" not in cfg or not isinstance(cfg["stock_symbols"], list):
-        raise ValueError("config.yaml must define 'stock_symbols' as a list")
 
-    for key in ("stock_start_date", "stock_end_date", "output_dir"):
-        if key not in cfg:
-            raise ValueError(f"config.yaml must define '{key}'")
-        if isinstance(cfg[key], str):
-            cfg[key] = cfg[key].strip()
-        if cfg[key] in (None, ""):
-            raise ValueError(f"'{key}' in config.yaml must not be empty")
-
-    columns_cfg = cfg.get("columns")
-    if columns_cfg is not None:
-        if not isinstance(columns_cfg, list) or not all(isinstance(c, str) for c in columns_cfg):
-            raise ValueError("'columns' in config.yaml must be a list of strings when provided")
-        cfg["columns"] = [c.strip() for c in columns_cfg if c.strip()]
-
-    numeric_cfg = cfg.get("numeric_columns")
-    if numeric_cfg is not None:
-        if not isinstance(numeric_cfg, list) or not all(isinstance(c, str) for c in numeric_cfg):
-            raise ValueError("'numeric_columns' in config.yaml must be a list of strings when provided")
-        cfg["numeric_columns"] = [c.strip() for c in numeric_cfg if c.strip()]
-
-    output_columns_cfg = cfg.get("output_columns")
-    if output_columns_cfg is not None:
-        if not isinstance(output_columns_cfg, list) or not all(isinstance(c, str) for c in output_columns_cfg):
-            raise ValueError("'output_columns' in config.yaml must be a list of strings when provided")
-        cfg["output_columns"] = [c.strip() for c in output_columns_cfg if c.strip()]
-
+def load_config(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+    if not isinstance(cfg, dict):
+        raise ValueError("Config file must contain a YAML mapping")
     return cfg
 
 
-def parse_date(val: Optional[str]) -> date:
-    if val is None:
-        return date.today()
-    s = str(val).strip().lower()
-    if s == "today":
-        return date.today()
-    # Try ISO formats
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    raise ValueError(f"Unrecognized date format: {val}")
+def ensure_required_keys(cfg: Dict[str, Any], keys: Iterable[str]) -> None:
+    missing = [key for key in keys if key not in cfg]
+    if missing:
+        raise KeyError(f"Config file is missing required keys: {', '.join(missing)}")
 
 
-def date_to_epoch_utc(d: date) -> int:
-    # midnight UTC for the given date
-    dt = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-    return int(dt.timestamp())
+def parse_date(value: Any, field: str) -> datetime:
+    if value is None:
+        raise ValueError(f"Config key '{field}' cannot be null")
+    text = str(value).strip()
+    if text == "":
+        raise ValueError(f"Config key '{field}' cannot be empty")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"Config key '{field}' must use YYYY-MM-DD format") from exc
 
 
-def ensure_dirs(base_dir: str) -> tuple[str, str]:
-    data_dir = os.path.join(base_dir, "data")
-    raw_dir = os.path.join(base_dir, "raw_data")
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(raw_dir, exist_ok=True)
-    return data_dir, raw_dir
+def normalize_symbols(raw_symbols: Any) -> list[str]:
+    if not isinstance(raw_symbols, Iterable) or isinstance(raw_symbols, (str, bytes)):
+        raise ValueError("'stock_symbols' must be a non-empty list of strings")
+    symbols = [str(symbol).strip().upper() for symbol in raw_symbols if str(symbol).strip()]
+    if not symbols:
+        raise ValueError("No valid stock symbols found in configuration")
+    return symbols
 
 
-def build_complete_calendar(start_d: date, end_d: date) -> pd.DataFrame:
-    if start_d > end_d:
-        raise ValueError("start date must be on or before end date")
-    num_days = (end_d - start_d).days + 1
-    all_dates = [start_d + timedelta(days=i) for i in range(num_days)]
-    df = pd.DataFrame({
-        "date": [d.strftime("%Y-%m-%d") for d in all_dates],
-        "timestamp": [date_to_epoch_utc(d) for d in all_dates],
-    })
+def read_value_series(csv_path: Path, value_column: str) -> pd.Series:
+    if not csv_path.exists():
+        LOGGER.warning("Missing CSV file: %s", csv_path)
+        return pd.Series(dtype=float)
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # pragma: no cover - surfaced to caller
+        raise RuntimeError(f"Failed to read CSV {csv_path}: {exc}") from exc
+
+    if df.empty or "date" not in df.columns or value_column not in df.columns:
+        LOGGER.warning("CSV %s missing required data columns", csv_path)
+        return pd.Series(dtype=float)
+
+    df = df[["date", value_column]].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df[value_column] = pd.to_numeric(df[value_column], errors="coerce")
+    df = df.dropna(subset=["date", value_column])
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    df = df.sort_values("date")
+    df = df.drop_duplicates(subset="date", keep="last")
+    series = df.set_index("date")[value_column]
+    series.index = pd.DatetimeIndex(series.index)  # ensure consistent dtype
+    return series.astype(float)
+
+
+def reindex_with_nearest(series: pd.Series, index: pd.DatetimeIndex) -> pd.Series:
+    if series.empty:
+        return pd.Series([float("nan")] * len(index), index=index, dtype=float)
+
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return pd.Series([float("nan")] * len(index), index=index, dtype=float)
+
+    cleaned = cleaned[~cleaned.index.duplicated(keep="last")]
+    cleaned = cleaned.sort_index()
+    try:
+        reindexed = cleaned.reindex(index, method="nearest")
+    except ValueError:
+        # Fallback: ensure monotonic index before reindexing
+        cleaned = cleaned.sort_index()
+        reindexed = cleaned.reindex(index, method="nearest")
+    return reindexed.astype(float)
+
+
+def build_output_dataframe(
+    dates: pd.DatetimeIndex,
+    price_series: pd.Series,
+    eps_series: pd.Series,
+) -> pd.DataFrame:
+    price_full = reindex_with_nearest(price_series, dates)
+    eps_full = reindex_with_nearest(eps_series, dates)
+
+    df = pd.DataFrame(
+        {
+            "date": dates.strftime("%Y-%m-%d"),
+            "avg_price": price_full.to_numpy(dtype=float),
+            "EPS": eps_full.to_numpy(dtype=float),
+        }
+    )
+
+    timestamps = (pd.Series(dates).astype("int64") // 10**9).to_numpy(dtype="int64")
+    df["timestamp"] = timestamps
     return df
 
 
-DEFAULT_NUMERIC_COLS = ["avg_price", "ESP", "FCF", "PBR", "ROE"]
-DEFAULT_OUTPUT_COLUMNS = [
-    "stock_symbol",
-    "date",
-    "avg_price",
-    "timestamp",
-    "ESP",
-    "FCF",
-    "PBR",
-    "ROE",
-]
-
-
-def _dedupe(seq: Iterable[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for item in seq:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def resolve_numeric_columns(cfg: dict) -> List[str]:
-    if cfg.get("numeric_columns"):
-        numeric = [c.strip() for c in cfg["numeric_columns"] if c.strip()]
-    elif cfg.get("columns"):
-        numeric = [
-            c.strip()
-            for c in cfg["columns"]
-            if c.strip() and c.strip() not in {"date", "timestamp", "stock_symbol"}
-        ]
-    else:
-        numeric = list(DEFAULT_NUMERIC_COLS)
-
-    if not numeric:
-        raise ValueError("Unable to determine numeric columns from config.yaml")
-
-    return _dedupe(numeric)
-
-
-def resolve_output_columns(cfg: dict, numeric_cols: List[str]) -> List[str]:
-    if cfg.get("output_columns"):
-        output_columns = [c for c in cfg["output_columns"] if c]
-    elif cfg.get("columns"):
-        output_columns = ["stock_symbol", "date", *cfg["columns"]]
-    else:
-        output_columns = list(DEFAULT_OUTPUT_COLUMNS)
-
-    mandatory = ["stock_symbol", "date", "timestamp"]
-    for col in numeric_cols:
-        if col not in output_columns:
-            output_columns.append(col)
-    for col in mandatory:
-        if col not in output_columns:
-            # Insert timestamp after date when possible for readability
-            if col == "timestamp" and "date" in output_columns:
-                insert_at = output_columns.index("date") + 1
-                output_columns.insert(insert_at, col)
-            else:
-                output_columns.insert(0, col)
-
-    return _dedupe(output_columns)
-
-
-def impute_symbol(
+def process_symbol(
     symbol: str,
-    base_dir: str,
-    start_d: date,
-    end_d: date,
-    numeric_cols: List[str],
-    output_columns: List[str],
-) -> Optional[str]:
-    data_dir, raw_dir = ensure_dirs(base_dir)
+    cfg: Dict[str, Any],
+    date_index: pd.DatetimeIndex,
+    raw_dir: Path,
+    data_dir: Path,
+) -> bool:
+    price_path = raw_dir / f"{symbol}_price.csv"
+    eps_path = raw_dir / f"{symbol}_eps.csv"
 
-    # Prefer Alpha Vantage style path first, fall back to processed data if needed
-    candidates = [
-        os.path.join(raw_dir, f"{symbol}.csv"),  # outputs/raw_data/SYM.csv
-        os.path.join(data_dir, f"{symbol}.csv"),  # outputs/data/SYM.csv
-        os.path.join(raw_dir, f"{symbol}.raw.csv"),  # outputs/raw_data/SYM.raw.csv
-    ]
-    src_path = next((p for p in candidates if os.path.exists(p)), None)
-    if src_path is None:
-        print(f"[WARN] No source CSV found for {symbol}; looked in {candidates}")
-        return None
+    price_series = read_value_series(price_path, "avg_price")
+    eps_series = read_value_series(eps_path, "EPS")
 
-    try:
-        df = pd.read_csv(src_path)
-    except Exception as e:
-        print(f"[ERROR] Failed to read {src_path}: {e}", file=sys.stderr)
-        return None
+    if price_series.empty and eps_series.empty:
+        LOGGER.warning("No data available for %s; skipping", symbol)
+        return False
 
-    required_cols = _dedupe([
-        "stock_symbol",
-        "date",
-        "timestamp",
-        *numeric_cols,
-        *output_columns,
-    ])
+    df = build_output_dataframe(date_index, price_series, eps_series)
 
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    # Coerce numeric columns to float for interpolation
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df[required_cols]
-
-    # Build complete daily calendar from config dates
-    calendar = build_complete_calendar(start_d, end_d)
-
-    # Merge input onto full calendar
-    merged = calendar.merge(df, on=["date", "timestamp"], how="left", suffixes=("", "_src"))
-
-    # Set stock_symbol column
-    merged["stock_symbol"] = symbol
-
-    # Interpolate/extrapolate numeric columns linearly along time index
-    # Use timestamp as numeric index to ensure 24h step and linear behavior
-    merged = merged.sort_values("timestamp").reset_index(drop=True)
-    merged_indexed = merged.set_index("timestamp")
-
-    for c in numeric_cols:
-        if c not in merged_indexed:
-            continue
-        s = merged_indexed[c].astype(float)
-        # Linear interpolation on index values, extrapolate both ends
-        s_interp = s.interpolate(method="index", limit_direction="both")
-        merged_indexed[c] = s_interp
-
-    # Restore timestamp and date columns and order
-    merged = merged_indexed.reset_index()
-    # Ensure date string matches timestamp (guard against mismatches)
-    merged["date"] = pd.to_datetime(merged["timestamp"], unit="s", utc=True).dt.strftime("%Y-%m-%d")
-
-    # Final column order
-    merged = merged[[col for col in output_columns if col in merged.columns]]
-
-    # Write output to data_dir/SYM.csv
-    out_path = os.path.join(data_dir, f"{symbol}.csv")
-    try:
-        merged.to_csv(out_path, index=False)
-    except Exception as e:
-        print(f"[ERROR] Failed to write {out_path}: {e}", file=sys.stderr)
-        return None
-
-    return out_path
+    data_dir.mkdir(parents=True, exist_ok=True)
+    output_path = data_dir / f"{symbol}.csv"
+    df.to_csv(output_path, index=False)
+    LOGGER.info("Wrote %s with %d rows", output_path, len(df))
+    return True
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    cfg = load_config(args.config)
+    configure_logging(args.quiet)
 
-    base_output = args.output.strip() if isinstance(args.output, str) and args.output.strip() else cfg["output_dir"]
+    cfg_path = Path(args.config)
+    cfg = load_config(cfg_path)
+    ensure_required_keys(cfg, ["stock_symbols", "stock_start_date", "stock_end_date", "output_dir"])
 
-    symbols: List[str] = [str(s).strip().upper() for s in cfg["stock_symbols"]]
-    start_d = parse_date(cfg.get("stock_start_date"))
-    end_d = parse_date(cfg.get("stock_end_date"))
+    symbols = normalize_symbols(cfg["stock_symbols"])
+    start_date = parse_date(cfg["stock_start_date"], "stock_start_date")
+    end_date = parse_date(cfg["stock_end_date"], "stock_end_date")
+    if end_date < start_date:
+        raise ValueError("'stock_end_date' must not be earlier than 'stock_start_date'")
 
-    if start_d > end_d:
-        raise ValueError("stock_start_date must be on or before stock_end_date")
+    date_index = pd.date_range(start=start_date, end=end_date, freq="D", tz=None, name="date")
 
-    numeric_cols = resolve_numeric_columns(cfg)
-    output_columns = resolve_output_columns(cfg, numeric_cols)
+    output_root = Path(cfg["output_dir"]).expanduser()
+    raw_dir = output_root / "raw_data"
+    data_dir = output_root / "data"
 
-    any_ok = False
-    for sym in symbols:
-        print(f"[INFO] Imputing {sym} from {start_d} to {end_d} ...")
-        out = impute_symbol(sym, base_output, start_d, end_d, numeric_cols, output_columns)
-        if out:
-            print(f"[OK] Wrote imputed data to {out}")
-            any_ok = True
-        else:
-            print(f"[WARN] Skipped {sym}; no output produced.")
+    any_success = False
+    for symbol in symbols:
+        try:
+            if process_symbol(symbol, cfg, date_index, raw_dir, data_dir):
+                any_success = True
+        except Exception as exc:
+            LOGGER.error("Failed to process %s: %s", symbol, exc)
 
-    if not any_ok:
-        print("[ERROR] No imputed data written. Check symbols and input files.", file=sys.stderr)
-        sys.exit(1)
+    if not any_success:
+        raise SystemExit("No output files were created; check input data")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:  # pragma: no cover - surfacing to CLI
+        LOGGER.error("%s", exc)
+        sys.exit(1)
