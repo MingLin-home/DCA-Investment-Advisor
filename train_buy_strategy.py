@@ -402,10 +402,11 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     symbols = tuple(str(sym) for sym in stock_symbols)
 
-    output_dir = Path(cfg.get("output_dir", "./outputs"))
-    data_dir = output_dir / "data"
-    forecast_dir = output_dir / "forcast"
-    checkpoint_dir = output_dir / "checkpoints"
+    base_output_dir = Path(cfg.get("output_dir", "./outputs"))
+    data_dir = base_output_dir / "data"
+    forecast_dir = base_output_dir / "forcast"
+    train_output_dir = base_output_dir / "train_buy_strategy"
+    checkpoint_dir = train_output_dir / "checkpoints"
 
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Stock data directory does not exist: {data_dir}")
@@ -776,10 +777,11 @@ def main() -> None:
 
     training_artifacts = run_training(cfg)
 
-    output_dir = Path(cfg.get("output_dir", "./outputs"))
-    ensure_directory(output_dir)
+    base_output_dir = Path(cfg.get("output_dir", "./outputs"))
+    train_output_dir = base_output_dir / "train_buy_strategy"
+    ensure_directory(train_output_dir)
 
-    buy_model_path = output_dir / "buy_model.npz"
+    buy_model_path = train_output_dir / "buy_model.npz"
     np.savez(
         buy_model_path,
         buy_W=training_artifacts["buy_W"],
@@ -787,12 +789,12 @@ def main() -> None:
     )
     print(f"Saved buy parameters to '{buy_model_path}'.")
 
-    buy_action_path = output_dir / "buy_action_now.json"
+    buy_action_path = train_output_dir / "buy_action_now.json"
     with buy_action_path.open("w", encoding="utf-8") as f:
         json.dump(training_artifacts["buy_action"], f, indent=2)
     print(f"Saved buy action recommendation to '{buy_action_path}'.")
 
-    termination_asset_path = output_dir / "termination_asset.csv"
+    termination_asset_path = train_output_dir / "termination_asset.csv"
     metrics = training_artifacts["termination_metrics"]
     rows = [
         {
@@ -830,7 +832,7 @@ def main() -> None:
     pd.DataFrame.from_records(rows).to_csv(termination_asset_path, index=False)
     print(f"Saved termination asset metrics to '{termination_asset_path}'.")
 
-    stochastic_buy_path = output_dir / "stochastic_buy_strategy.csv"
+    stochastic_buy_path = train_output_dir / "stochastic_buy_strategy.csv"
     stochastic_buy = training_artifacts["stochastic_buy_strategy"]
     symbols = training_artifacts["symbols"]
     batch_size, num_stocks, num_steps = stochastic_buy.shape
