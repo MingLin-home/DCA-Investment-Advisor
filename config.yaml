@@ -42,3 +42,11 @@ simulate_time_interval: 30
 simulation_batch_size: 2048
 simulation_T: 6
 batch_gain_alpha: 0.5
+log_interval: 100
+train_buy_strategy:
+  penalty_factor: 100.0
+  lr: 1e-6
+  weight_decay: 1e-4
+  optimizer: sgd
+  max_num_iters: 10000
+  loss_avg_decay: 0.99
