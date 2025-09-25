@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -158,6 +159,20 @@ def ensure_float(cfg: Dict[str, Any], key: str) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Configuration key '{key}' must be a float") from exc
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds >= 3600:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    if seconds >= 60:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{seconds:.1f}s"
 
 
 def build_datasets(stock_symbols: Sequence[str], cfg: Dict[str, Any]) -> List[SingleStockDataset]:
@@ -388,6 +403,7 @@ def main() -> None:
         model.train()
         data_iter = iter(dataloader)
         loss_moving_avg: Optional[float] = None
+        train_start = time.perf_counter()
         for step in range(max_num_iters):
             x_batch, y_batch = next(data_iter)
             x_batch = x_batch.to(device=device, dtype=torch.float32)
@@ -425,10 +441,14 @@ def main() -> None:
 
             if should_print:
                 current_lr = scheduler.get_last_lr()[0]
+                elapsed = time.perf_counter() - train_start
+                eta_seconds = elapsed * (1.0 - progress) / progress if progress > 0 else None
+                eta_display = format_duration(eta_seconds) if eta_seconds is not None else "--"
                 print(
                     f"step={step_idx:06d}, loss={loss_value:.6f}, "
                     f"loss_avg={loss_moving_avg:.6f}, "
-                    f"relative_loss={relative_loss_value:.6f}, lr={current_lr:.6e}",
+                    f"relative_loss={relative_loss_value:.6f}, lr={current_lr:.6e}, "
+                    f"eta={eta_display}",
                     flush=True,
                 )
 
