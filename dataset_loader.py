@@ -59,17 +59,29 @@ class SingleStockDataset:
 
         # Convert to NumPy array (float32); timestamps as float for homogeneity
         data_raw = df.to_numpy(dtype=np.float32)
+        if data_raw.size == 0:
+            raise ValueError(f"CSV {csv_path} contains no rows to load")
 
         # Column index mapping for convenience
         self.col_index = {name: i for i, name in enumerate(self.columns)}
 
-        # Pre-compute per-column normalization statistics using NaN-aware ops
-        # Use population std (unbiased=False) and guard against zeros
-        # Keep both vector forms and per-column dicts
-        mean_vec = np.nanmean(data_raw, axis=0).astype(np.float32)
-        # population std (ddof=0)
-        std_vec = np.nanstd(data_raw, axis=0, ddof=0).astype(np.float32)
-        std_vec = np.maximum(std_vec, 1e-8).astype(np.float32)
+        # Identify columns that contain at least one finite datapoint
+        num_columns = data_raw.shape[1]
+        valid_counts = np.sum(~np.isnan(data_raw), axis=0)
+        valid_mask = valid_counts > 0
+
+        # Pre-compute per-column normalization statistics using NaN-aware ops.
+        # Fallback to mean=0/std=1 for columns that are entirely NaN so we avoid
+        # RuntimeWarnings from numpy and keep normalization stable.
+        mean_vec = np.zeros(num_columns, dtype=np.float32)
+        std_vec = np.ones(num_columns, dtype=np.float32)
+        if np.any(valid_mask):
+            valid_data = data_raw[:, valid_mask]
+            mean_valid = np.nanmean(valid_data, axis=0).astype(np.float32)
+            std_valid = np.nanstd(valid_data, axis=0, ddof=0).astype(np.float32)
+            std_valid = np.maximum(std_valid, 1e-8).astype(np.float32)
+            mean_vec[valid_mask] = mean_valid
+            std_vec[valid_mask] = std_valid
 
         # Store vector stats for multi-column normalization
         self._mean_vec: np.ndarray = mean_vec
@@ -79,9 +91,12 @@ class SingleStockDataset:
         self.mean = {col: float(mean_vec[i]) for col, i in self.col_index.items()}
         self.std = {col: float(std_vec[i]) for col, i in self.col_index.items()}
 
+        # Replace NaNs with column means (or zero for empty columns) before normalizing
+        data_centered = np.where(np.isnan(data_raw), mean_vec, data_raw).astype(np.float32)
+
         # Normalize data immediately and keep both raw and normalized versions
         self._data_raw = data_raw
-        self.data = (data_raw - mean_vec) / std_vec
+        self.data = (data_centered - mean_vec) / std_vec
 
         # Keep a copy of timestamps for date range sampling and direct lookup
         df_all = pd.read_csv(csv_path, usecols=["timestamp"])  # raises if column missing
