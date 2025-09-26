@@ -86,7 +86,7 @@ class SingleStockDataset:
             mean_vec[valid_mask] = mean_valid
             std_vec[valid_mask] = std_valid
 
-        # Store vector stats for multi-column normalization
+        # Store vector stats for optional normalization helpers
         self._mean_vec: np.ndarray = mean_vec
         self._std_vec: np.ndarray = std_vec
 
@@ -94,12 +94,11 @@ class SingleStockDataset:
         self.mean = {col: float(mean_vec[i]) for col, i in self.col_index.items()}
         self.std = {col: float(std_vec[i]) for col, i in self.col_index.items()}
 
-        # Replace NaNs with column means (or zero for empty columns) before normalizing
-        data_centered = np.where(np.isnan(data_raw), mean_vec, data_raw).astype(np.float32)
+        # Replace NaNs with column means (or zero for empty columns) to keep data usable
+        data_imputed = np.where(np.isnan(data_raw), mean_vec, data_raw).astype(np.float32)
 
-        # Normalize data immediately and keep both raw and normalized versions
-        self._data_raw = data_raw
-        self.data = (data_centered - mean_vec) / std_vec
+        # Keep data in raw (non-normalized) scale for downstream consumers
+        self.data = data_imputed
 
         # Keep a copy of timestamps for date range sampling and direct lookup
         df_all = pd.read_csv(csv_path, usecols=["timestamp"])  # raises if column missing
@@ -329,7 +328,7 @@ class SingleStockDataset:
 
     # --- Accessors respecting normalization and sampling range ---
     def get_data_at_index(self, index: int) -> np.ndarray:
-        """Return normalized feature vector [num_columns] at dataset row `index`.
+        """Return feature vector [num_columns] at dataset row `index`.
 
         Valid indices are 0 <= index < len(self).
         """
@@ -381,7 +380,7 @@ class SingleStockDataset:
             )
         price_idx = int(self.col_index["avg_price"])
 
-        # Slice normalized data
+        # Slice raw data
         sample_np = self.data[i - history_window_size : i]
         future_np = self.data[i : i + future_window_size, price_idx]
 

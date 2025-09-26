@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, IterableDataset
 
-from dataset_loader import SingleStockDataset, extract_price_trend
+from dataset_loader import SingleStockDataset
 
 
 class MultiStockBatchDataset(IterableDataset[Tuple[torch.Tensor, torch.Tensor]]):
@@ -75,11 +75,11 @@ class MultiStockBatchDataset(IterableDataset[Tuple[torch.Tensor, torch.Tensor]])
                     )
 
                 x_series = x_np[:, price_idx]
-                trend = extract_price_trend(np.asarray(future_price, dtype=np.float32))
-                y_vec = np.array(
-                    [trend["k"], trend["b"], trend["std"]],
-                    dtype=np.float32,
-                )
+                y_vec = np.asarray(future_price, dtype=np.float32)
+                if y_vec.ndim != 1:
+                    raise ValueError(
+                        f"future_price must be 1D, got shape {tuple(y_vec.shape)}"
+                    )
 
                 xs.append(torch.tensor(x_series, dtype=torch.float32))
                 ys.append(torch.tensor(y_vec, dtype=torch.float32))
@@ -92,8 +92,10 @@ class MultiStockBatchDataset(IterableDataset[Tuple[torch.Tensor, torch.Tensor]])
 class LinearTrendModel(torch.nn.Module):
     def __init__(self, input_dim: int) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(input_dim, 3, dtype=torch.float32))
-        self.bias = torch.nn.Parameter(torch.zeros(3, dtype=torch.float32))
+        self.weight = torch.nn.Parameter(torch.empty(input_dim, 3, dtype=torch.float32))
+        self.bias = torch.nn.Parameter(torch.empty(3, dtype=torch.float32))
+        torch.nn.init.normal_(self.weight, mean=0.0, std=1e-4)
+        torch.nn.init.normal_(self.bias, mean=0.0, std=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weight + self.bias
@@ -161,6 +163,16 @@ def ensure_float(cfg: Dict[str, Any], key: str) -> float:
         raise ValueError(f"Configuration key '{key}' must be a float") from exc
 
 
+def get_optional_float(cfg: Dict[str, Any], key: str, default: float) -> float:
+    value = cfg.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Configuration key '{key}' must be a float if provided"
+        ) from exc
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0.0, float(seconds))
     if seconds >= 3600:
@@ -206,7 +218,18 @@ def create_optimizer(
     if optimizer_name == "sgd":
         return torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay)
     if optimizer_name == "adam":
-        return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        beta1 = get_optional_float(train_cfg, "adam_beta1", 0.9)
+        beta2 = get_optional_float(train_cfg, "adam_beta2", 0.999)
+        eps = get_optional_float(train_cfg, "adam_eps", 1e-8)
+        if not (0.0 < beta1 < 1.0 and 0.0 < beta2 < 1.0):
+            raise ValueError("'adam_beta1' and 'adam_beta2' must be in the interval (0, 1)")
+        return torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(beta1, beta2),
+            eps=eps,
+        )
     raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
 
 
@@ -296,12 +319,9 @@ def forecast_prices(
                 f"Model output for {symbol} has unexpected shape {preds_flat.shape}"
             )
 
-        price_mean = float(dataset.mean["avg_price"])
-        price_std = float(dataset.std["avg_price"])
-
-        pred_k = float(preds_flat[0] * price_std)
-        pred_b = float(preds_flat[1] * price_std + price_mean)
-        pred_std = float(preds_flat[2] * price_std)
+        pred_k = float(preds_flat[0])
+        pred_b = float(preds_flat[1])
+        pred_std = float(preds_flat[2])
 
         forecast_path = os.path.join(forecast_dir, f"{symbol}.json")
         output_payload = {
@@ -313,6 +333,19 @@ def forecast_prices(
         with open(forecast_path, "w", encoding="utf-8") as f:
             json.dump(output_payload, f, indent=2)
 
+def get_loss(preds, y_batch):
+    k = preds[:,0].reshape(-1,1)
+    b = preds[:,0].reshape(-1,1)
+    sigma = preds[:,0].reshape(-1,1)
+    sigma2 = (sigma**2 + 1e-6)
+    T = y_batch.shape[1]
+    t = torch.arange(T, device=preds.device, dtype=preds.dtype).reshape(1, -1)
+    pred_y = k * t + b
+    loss1 = (pred_y - y_batch)**2 / sigma2 /  2
+    loss2 = torch.log(sigma2) / 2
+    loss = loss1.mean() + loss2.mean()
+    
+    return loss
 
 def main() -> None:
     args = parse_args()
@@ -335,7 +368,7 @@ def main() -> None:
     aggregated_length = history_window_size // agg_window_size
     feature_dim = aggregated_length * 2
 
-    batch_size = ensure_positive_int(cfg, "train_batch_size")
+    batch_size = int(train_cfg["train_batch_size"])
     num_workers = int(cfg.get("num_workers", 0))
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
@@ -411,12 +444,9 @@ def main() -> None:
 
             x_agg = aggregate_history(x_batch, agg_window_size)
             preds = model(x_agg)
-            loss = F.mse_loss(preds, y_batch)
-            naive_loss = torch.mean(y_batch**2)
-            relative_loss = loss / (naive_loss + 1e-8)
+            loss = get_loss(preds, y_batch)
 
             loss_value = float(loss.item())
-            relative_loss_value = float(relative_loss.item())
             if loss_moving_avg is None:
                 loss_moving_avg = loss_value
             else:
@@ -446,8 +476,7 @@ def main() -> None:
                 eta_display = format_duration(eta_seconds) if eta_seconds is not None else "--"
                 print(
                     f"step={step_idx:06d}, loss={loss_value:.6f}, "
-                    f"loss_avg={loss_moving_avg:.6f}, "
-                    f"relative_loss={relative_loss_value:.6f}, lr={current_lr:.6e}, "
+                    f"loss_avg={loss_moving_avg:.6f}, lr={current_lr:.6e}, "
                     f"eta={eta_display}",
                     flush=True,
                 )
