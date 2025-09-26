@@ -54,13 +54,14 @@ num_workers: 8
 #   log_interval: 1000
 
 train_buy_strategy:
+  simulation_T: 12
   overbuy_penalty_factor: 10.0
   sell_penalty_factor: 10.0
   simulate_time_interval: 30
   simulation_batch_size: 1024
-  lr: 1e-8
-  weight_decay: 1e-4
-  optimizer: sgd
+  lr: 1e-6
+  weight_decay: 1e-6
+  optimizer: adam
   max_num_iters: 1000000
   loss_avg_decay: 0.99
   batch_gain_alpha: 0.5

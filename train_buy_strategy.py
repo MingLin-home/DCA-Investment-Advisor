@@ -251,7 +251,7 @@ def get_termination_asset_value(
     sell_penalty_factor_tensor = ones.new_tensor(float(sell_penalty_factor))
     overbuy_penalty = torch.clamp(spent - ones, min=0) * overbuy_penalty_factor_tensor
     sell_penalty = (
-        -buy_strategy.clamp(max=0)
+        (-1*buy_strategy).clamp(min=0)
     ).sum(dim=[-1, -2]) * sell_penalty_factor_tensor
     termination_asset_value = raw_value - overbuy_penalty - sell_penalty
 
@@ -519,24 +519,22 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if simulation_batch_size <= 0:
         raise ValueError("'simulation_batch_size' must be a positive integer")
 
-    simulation_T_raw = cfg.get("simulation_T")
-    if simulation_T_raw is None:
-        simulation_T_raw = 6
-    simulation_T = int(simulation_T_raw)
-    if simulation_T <= 0:
-        raise ValueError("'simulation_T' must be a positive integer")
+    simulation_T = int(get_train_setting("simulation_T", None))
 
-    simulate_time_interval = int(get_train_setting("simulate_time_interval", 1))
-    simulate_time_interval = max(simulate_time_interval, 1)
+    optimizer_name = str(get_train_setting("optimizer", "sgd")).strip().lower()
+    lr_cfg = get_train_setting("lr", None)
+    weight_decay_cfg = get_train_setting("weight_decay", 0.0)
 
-    lr = float(get_train_setting("lr", 1e-3))
-    weight_decay = float(get_train_setting("weight_decay", 0.0))
-    alpha_raw = cfg.get("batch_gain_alpha")
-    if alpha_raw is None:
-        alpha_raw = 0.1
-    alpha = float(alpha_raw)
-    if alpha <= 0:
-        raise ValueError("'batch_gain_alpha' must be a positive float")
+    if optimizer_name == "sgd":
+        if lr_cfg is None:
+            raise ValueError("'lr' must be provided when optimizer is 'sgd'")
+        lr = float(lr_cfg)
+        weight_decay = float(weight_decay_cfg)
+    else:
+        lr = None
+        weight_decay = None
+    alpha = float(get_train_setting("batch_gain_alpha",None))
+    simulate_time_interval = int(get_train_setting("simulate_time_interval",None))
 
     overbuy_penalty_cfg = get_train_setting("overbuy_penalty_factor", None)
     sell_penalty_cfg = get_train_setting("sell_penalty_factor", None)
@@ -555,7 +553,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if sell_penalty_factor < 0:
         raise ValueError("'sell_penalty_factor' must be a non-negative float")
 
-    max_num_iters = int(get_train_setting("max_num_iters", 1000))
+    max_num_iters = int(get_train_setting("max_num_iters", None))
     if max_num_iters <= 0:
         raise ValueError("'max_num_iters' must be a positive integer")
 
@@ -580,7 +578,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             log_interval_iters = int(round(log_interval_value * max_num_iters))
             log_interval_iters = max(1, log_interval_iters)
 
-    checkpoint_interval = max(1, int(math.ceil(max_num_iters * 0.01)))
+    checkpoint_interval = max(1, int(math.ceil(max_num_iters * 0.05)))
 
     init_std = 1e-6 / math.sqrt(float(num_stocks))
     buy_W = torch.normal(
@@ -600,20 +598,20 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     )
     buy_b.requires_grad_()
 
-    optimizer_name = str(get_train_setting("optimizer", "sgd")).strip().lower()
     if optimizer_name == "sgd":
-        optimizer_cls = torch.optim.SGD
+        optimizer = torch.optim.SGD([
+            buy_W,
+            buy_b,
+        ], lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "adam":
-        optimizer_cls = torch.optim.Adam
+        optimizer = torch.optim.Adam([
+            buy_W,
+            buy_b,
+        ])
     else:
         raise ValueError(
             f"Unsupported optimizer '{optimizer_name}'. Expected one of: sgd, adam."
         )
-
-    optimizer = optimizer_cls([
-        buy_W,
-        buy_b,
-    ], lr=lr, weight_decay=weight_decay)
 
     resume_iteration, final_checkpoint_loaded = load_latest_checkpoint(
         checkpoint_dir,
