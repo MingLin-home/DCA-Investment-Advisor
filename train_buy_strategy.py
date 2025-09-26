@@ -530,9 +530,20 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("'lr' must be provided when optimizer is 'sgd'")
         lr = float(lr_cfg)
         weight_decay = float(weight_decay_cfg)
+    elif optimizer_name == "adam":
+        lr = float(lr_cfg) if lr_cfg is not None else torch.optim.Adam.defaults["lr"]
+        weight_decay = float(weight_decay_cfg)
     else:
         lr = None
         weight_decay = None
+    gradient_norm_clip_cfg = get_train_setting("gradient_norm_clip", None)
+    if gradient_norm_clip_cfg is None:
+        gradient_norm_clip = None
+    else:
+        gradient_norm_clip = float(gradient_norm_clip_cfg)
+        if gradient_norm_clip <= 0:
+            raise ValueError("'gradient_norm_clip' must be a positive float")
+
     alpha = float(get_train_setting("batch_gain_alpha",None))
     simulate_time_interval = int(get_train_setting("simulate_time_interval",None))
 
@@ -607,7 +618,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         optimizer = torch.optim.Adam([
             buy_W,
             buy_b,
-        ])
+        ], lr=lr, weight_decay=weight_decay)
     else:
         raise ValueError(
             f"Unsupported optimizer '{optimizer_name}'. Expected one of: sgd, adam."
@@ -651,6 +662,8 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         loss = -batch_gain
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if gradient_norm_clip is not None:
+            torch.nn.utils.clip_grad_norm_((buy_W, buy_b), max_norm=gradient_norm_clip)
         optimizer.step()
 
         iterations_completed = iteration - resume_iteration
