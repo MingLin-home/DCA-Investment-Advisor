@@ -7,7 +7,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -99,32 +98,6 @@ class LinearTrendModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weight + self.bias
-
-
-def save_model_npz(model: LinearTrendModel, path: str) -> None:
-    """Persist model parameters as NumPy arrays."""
-    weight_np = model.weight.detach().cpu().numpy()
-    bias_np = model.bias.detach().cpu().numpy().reshape(1, 3)
-    np.savez(path, W=weight_np, b=bias_np)
-
-
-def load_model_npz(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load model parameters stored via ``save_model_npz``."""
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Model file not found: {path}")
-
-    with np.load(path) as data:
-        weight_np = data["W"].astype(np.float32, copy=False)
-        bias_np = data["b"].astype(np.float32, copy=False)
-
-    if bias_np.ndim == 2:
-        bias_np = bias_np.reshape(-1)
-    elif bias_np.ndim != 1:
-        raise ValueError(
-            f"Unexpected bias array shape {bias_np.shape}; expected (3,) or (1, 3)"
-        )
-
-    return weight_np, bias_np
 
 
 def parse_args() -> argparse.Namespace:
@@ -231,33 +204,10 @@ def create_optimizer(
             eps=eps,
         )
     raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
-
-
-def set_model_parameters_from_numpy(
-    model: LinearTrendModel, weight_np: np.ndarray, bias_np: np.ndarray
-) -> None:
-    """Copy NumPy weights/bias into a ``LinearTrendModel`` instance."""
-
-    if weight_np.shape != tuple(model.weight.shape):
-        raise ValueError(
-            f"Weight shape mismatch: expected {tuple(model.weight.shape)}, got {tuple(weight_np.shape)}"
-        )
-    if bias_np.shape != tuple(model.bias.shape):
-        raise ValueError(
-            f"Bias shape mismatch: expected {tuple(model.bias.shape)}, got {tuple(bias_np.shape)}"
-        )
-
-    weight_tensor = torch.from_numpy(weight_np).to(model.weight.data.device)
-    bias_tensor = torch.from_numpy(bias_np).to(model.bias.data.device)
-    model.weight.data.copy_(weight_tensor)
-    model.bias.data.copy_(bias_tensor)
-
-
 def forecast_prices(
     cfg: Dict[str, Any],
     datasets: Sequence[SingleStockDataset],
-    weight_np: np.ndarray,
-    bias_np: np.ndarray,
+    model: LinearTrendModel,
     stock_end_date: Optional[str] = None,
 ) -> None:
     """Generate price trend forecasts for each stock symbol."""
@@ -282,6 +232,9 @@ def forecast_prices(
 
     forecast_dir = os.path.join(output_dir, "forecast")
     os.makedirs(forecast_dir, exist_ok=True)
+
+    model.eval()
+    model_device = next(model.parameters()).device
 
     for dataset in datasets:
         symbol = dataset.stock_symbol
@@ -308,12 +261,16 @@ def forecast_prices(
                 f" expected {history_window_size}"
             )
 
-        x_tensor = torch.from_numpy(normalized_series.astype(np.float32, copy=False)).unsqueeze(0)
+        x_tensor = (
+            torch.from_numpy(normalized_series.astype(np.float32, copy=False))
+            .unsqueeze(0)
+        )
         x_agg = aggregate_history(x_tensor, agg_window_size)
-        x_agg_np = x_agg.numpy()
 
-        preds = x_agg_np @ weight_np + bias_np
-        preds_flat = preds.reshape(-1)
+        with torch.no_grad():
+            preds_tensor = model(x_agg.to(device=model_device))
+
+        preds_flat = preds_tensor.detach().cpu().numpy().reshape(-1)
         if preds_flat.shape[0] != 3:
             raise ValueError(
                 f"Model output for {symbol} has unexpected shape {preds_flat.shape}"
@@ -391,19 +348,30 @@ def main() -> None:
     save_dir = os.path.join(output_dir, "train_price_eps_model")
     os.makedirs(save_dir, exist_ok=True)
 
-    final_path = os.path.join(save_dir, "model.npz")
+    model_path = os.path.join(save_dir, "model.pt")
 
     datasets = build_datasets(stock_symbols, cfg)
 
     model = LinearTrendModel(feature_dim)
-    weight_np: Optional[np.ndarray] = None
-    bias_np: Optional[np.ndarray] = None
+    state_loaded = False
 
-    if os.path.isfile(final_path):
-        weight_np, bias_np = load_model_npz(final_path)
-        set_model_parameters_from_numpy(model, weight_np, bias_np)
-        print(f"Loaded existing model parameters from {final_path}; skipping training.")
+    if os.path.isfile(model_path):
+        state_dict = torch.load(model_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+        state_loaded = True
+        print(f"Loaded existing model parameters from {model_path}; skipping training.")
+
+    device_choice = str(cfg.get("device", "cpu")).strip().lower()
+    if device_choice not in {"cpu", "cuda"}:
+        raise ValueError("config 'device' must be either 'cpu' or 'cuda'")
+    if device_choice == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but torch.cuda.is_available() is False")
+        device = torch.device("cuda")
     else:
+        device = torch.device("cpu")
+
+    if not state_loaded:
         dataset = MultiStockBatchDataset(
             stock_datasets=datasets,
             batch_size=batch_size,
@@ -414,7 +382,7 @@ def main() -> None:
             batch_size=None,
             num_workers=num_workers,
             persistent_workers=num_workers > 0,
-            pin_memory=False,
+            pin_memory=device.type == "cuda",
         )
 
         optimizer = create_optimizer(model, train_cfg)
@@ -425,7 +393,6 @@ def main() -> None:
             total_iters=max_num_iters,
         )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
 
         next_print_fraction = 0.001
@@ -439,8 +406,8 @@ def main() -> None:
         train_start = time.perf_counter()
         for step in range(max_num_iters):
             x_batch, y_batch = next(data_iter)
-            x_batch = x_batch.to(device=device, dtype=torch.float32)
-            y_batch = y_batch.to(device=device, dtype=torch.float32)
+            x_batch = x_batch.to(device=device, dtype=torch.float32, non_blocking=True)
+            y_batch = y_batch.to(device=device, dtype=torch.float32, non_blocking=True)
 
             x_agg = aggregate_history(x_batch, agg_window_size)
             preds = model(x_agg)
@@ -488,8 +455,8 @@ def main() -> None:
                 next_save_fraction += 0.01
 
             if should_save:
-                checkpoint_path = os.path.join(save_dir, f"model_step_{step_idx:06d}.npz")
-                save_model_npz(model, checkpoint_path)
+                checkpoint_path = os.path.join(save_dir, f"model_step_{step_idx:06d}.pt")
+                torch.save(model.state_dict(), checkpoint_path)
                 checkpoint_paths.append(checkpoint_path)
                 if len(checkpoint_paths) > 5:
                     oldest_path = checkpoint_paths.pop(0)
@@ -501,21 +468,16 @@ def main() -> None:
                             flush=True,
                         )
 
-        model.to("cpu")
-        final_path = os.path.join(save_dir, "model.npz")
-        save_model_npz(model, final_path)
-        print(f"Model parameters saved to {final_path}")
-        weight_np, bias_np = load_model_npz(final_path)
-        set_model_parameters_from_numpy(model, weight_np, bias_np)
+        model.to(torch.device("cpu"))
+        torch.save(model.state_dict(), model_path)
+        print(f"Model parameters saved to {model_path}")
 
-    if weight_np is None or bias_np is None:
-        weight_np, bias_np = load_model_npz(final_path)
+    model.to(torch.device("cpu"))
 
     forecast_prices(
         cfg=cfg,
         datasets=datasets,
-        weight_np=weight_np,
-        bias_np=bias_np,
+        model=model,
     )
 
 
