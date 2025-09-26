@@ -7,11 +7,12 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import yaml
 
 def parse_args() -> argparse.Namespace:
@@ -62,13 +63,12 @@ def checkpoint_iteration_from_path(path: Path) -> int | None:
 def load_latest_checkpoint(
     checkpoint_dir: Path,
     device: torch.device,
-    buy_W: torch.Tensor,
-    buy_b: torch.Tensor,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     max_num_iters: int,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, Optional[Dict[str, Any]]]:
     if not checkpoint_dir.is_dir():
-        return 0, False
+        return 0, False, None
 
     latest: tuple[int, Path] | None = None
     for path in checkpoint_dir.glob("checkpoint_iter_*.pt"):
@@ -79,20 +79,47 @@ def load_latest_checkpoint(
             latest = (iteration, path)
 
     if latest is None:
-        return 0, False
+        return 0, False, None
 
     iteration, checkpoint_path = latest
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
-    buy_W_state = checkpoint.get("buy_W")
-    buy_b_state = checkpoint.get("buy_b")
+    checkpoint_metadata = checkpoint.get("model_metadata")
+    if isinstance(checkpoint_metadata, dict):
+        checkpoint_model_name = checkpoint_metadata.get("name")
+        if checkpoint_model_name is not None:
+            checkpoint_model_name = str(checkpoint_model_name).strip().lower()
+            current_model_name = infer_model_name(model)
+            if checkpoint_model_name != current_model_name:
+                raise ValueError(
+                    "Checkpoint model type does not match the configured model type."
+                )
+
+    model_state = checkpoint.get("model_state")
     optimizer_state = checkpoint.get("optimizer_state")
 
-    if buy_W_state is None or buy_b_state is None or optimizer_state is None:
-        raise ValueError(f"Checkpoint '{checkpoint_path}' is missing required data.")
+    if optimizer_state is None:
+        raise ValueError(f"Checkpoint '{checkpoint_path}' is missing optimizer state.")
 
-    buy_W.data.copy_(buy_W_state.to(device))
-    buy_b.data.copy_(buy_b_state.to(device))
+    if model_state is not None:
+        model.load_state_dict(model_state)
+    else:
+        # Legacy checkpoint support for linear weights.
+        buy_W_state = checkpoint.get("buy_W")
+        buy_b_state = checkpoint.get("buy_b")
+        if buy_W_state is None or buy_b_state is None:
+            raise ValueError(
+                f"Checkpoint '{checkpoint_path}' is missing model parameters."
+            )
+        if not isinstance(model, LinearBuyStrategyModel):
+            raise ValueError(
+                "Legacy checkpoint with linear weights cannot be loaded into a non-linear model."
+            )
+        with torch.no_grad():
+            model.linear.weight.data.copy_(buy_W_state.to(device))
+            model.linear.bias.data.copy_(buy_b_state.to(device))
+
+    model.to(device)
     optimizer.load_state_dict(optimizer_state)
 
     stored_max_iters = checkpoint.get("max_num_iters")
@@ -103,24 +130,25 @@ def load_latest_checkpoint(
         )
 
     print(f"Loaded checkpoint from iteration {iteration} ({checkpoint_path}).")
-    return iteration, iteration >= max_num_iters
+    metadata_return = checkpoint_metadata if isinstance(checkpoint_metadata, dict) else None
+    return iteration, iteration >= max_num_iters, metadata_return
 
 
 def save_checkpoint(
     checkpoint_dir: Path,
     iteration: int,
-    buy_W: torch.Tensor,
-    buy_b: torch.Tensor,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     max_num_iters: int,
+    model_metadata: Dict[str, Any],
     keep: int = 3,
 ) -> None:
     ensure_directory(checkpoint_dir)
     checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration:06d}.pt"
     checkpoint = {
         "iteration": iteration,
-        "buy_W": buy_W.detach().cpu(),
-        "buy_b": buy_b.detach().cpu(),
+        "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        "model_metadata": model_metadata,
         "optimizer_state": optimizer.state_dict(),
         "max_num_iters": max_num_iters,
     }
@@ -159,6 +187,119 @@ def normalize_symbol_list(raw: Any, field_name: str) -> list[str]:
             continue
         symbols.append(symbol)
     return symbols
+
+
+class LinearBuyStrategyModel(nn.Module):
+    """Linear mapping from current prices to buy allocations."""
+
+    def __init__(self, input_dim: int, init_std: float) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be a positive integer")
+        self.linear = nn.Linear(input_dim, input_dim)
+        with torch.no_grad():
+            nn.init.normal_(self.linear.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.linear.bias, mean=0.0, std=init_std)
+
+    def forward(self, price: torch.Tensor) -> torch.Tensor:
+        return self.linear(price)
+
+
+class ResidualMLPBuyStrategyModel(nn.Module):
+    """Residual MLP where each block includes a skip connection."""
+
+    class ResidualBlock(nn.Module):
+        def __init__(self, in_dim: int, out_dim: int) -> None:
+            super().__init__()
+            self.linear = nn.Linear(in_dim, out_dim)
+            self.activation = nn.GELU()
+            self.residual_proj: nn.Module | None = None
+            if in_dim != out_dim:
+                self.residual_proj = nn.Linear(in_dim, out_dim, bias=False)
+
+            self._reset_parameters()
+
+        def _reset_parameters(self) -> None:
+            nn.init.kaiming_normal_(self.linear.weight, nonlinearity="linear")
+            nn.init.zeros_(self.linear.bias)
+            if self.residual_proj is not None:
+                nn.init.xavier_normal_(self.residual_proj.weight)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            residual = x if self.residual_proj is None else self.residual_proj(x)
+            out = self.linear(x)
+            out = self.activation(out)
+            return out + residual
+
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError("input_dim must be a positive integer")
+        if hidden_dim <= 0:
+            raise ValueError("mlp_hidden_dim must be a positive integer")
+        if num_layers < 0:
+            raise ValueError("mlp_layers must be a non-negative integer")
+
+        blocks: list[nn.Module] = []
+        in_dim = input_dim
+        for _ in range(num_layers):
+            block = ResidualMLPBuyStrategyModel.ResidualBlock(in_dim, hidden_dim)
+            blocks.append(block)
+            in_dim = hidden_dim
+
+        self.blocks = nn.ModuleList(blocks)
+        self.output_layer = nn.Linear(in_dim, input_dim)
+        self._reset_output_parameters()
+
+    def _reset_output_parameters(self) -> None:
+        nn.init.zeros_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+
+    def forward(self, price: torch.Tensor) -> torch.Tensor:
+        hidden = price
+        for block in self.blocks:
+            hidden = block(hidden)
+        delta = self.output_layer(hidden)
+        return delta
+
+
+def infer_model_name(model: nn.Module) -> str:
+    if isinstance(model, LinearBuyStrategyModel):
+        return "linear"
+    if isinstance(model, ResidualMLPBuyStrategyModel):
+        return "mlp"
+    return model.__class__.__name__.lower()
+
+
+def prepare_model_export(
+    state_dict: Dict[str, torch.Tensor],
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Convert a model state dict and metadata to numpy-friendly payload."""
+    state_dict = {k: v.detach().cpu() for k, v in state_dict.items()}
+    export: Dict[str, Any] = {}
+
+    key_list: list[str] = []
+    for idx, (key, tensor) in enumerate(state_dict.items()):
+        key_list.append(key)
+        export[f"param_{idx}"] = tensor.numpy()
+
+    export["model_type"] = np.array(str(metadata.get("name", "")))
+    export["state_keys"] = np.array(key_list)
+
+    config = metadata.get("config")
+    if config is not None:
+        export["model_config_json"] = np.array(json.dumps(config))
+
+    # Provide linear-specific shortcuts for backward compatibility when possible.
+    if metadata.get("name") == "linear":
+        weight = state_dict.get("linear.weight")
+        bias = state_dict.get("linear.bias")
+        if weight is not None and bias is not None:
+            export["buy_W"] = weight.numpy()
+            export["buy_b"] = bias.numpy()
+
+    return export
 
 def get_batch_gain(batched_termination_asset_value: torch.Tensor, alpha: float):
     """
@@ -259,59 +400,44 @@ def get_termination_asset_value(
         return termination_asset_value.squeeze(0)
     return termination_asset_value
 
-def get_buy_strategy(price_trajectory: torch.Tensor, buy_W: torch.Tensor, buy_b: torch.Tensor):
-    """
-    compute how much money I should spend on each stock.
-    price_trajectory: tensor of shape (M, T) or (B, M, T).
-    buy_W : tensor of shape (M, M). Model parameters to compute the buying strategy.
-    buy_b: tensor of shape (M,). Model parameters to compute the buying strategy.
-    
-    Return:
-    buy_strategy: tensor of shape (M, T) or (B, M, T) matching price_trajectory.
-    
-    buy_strategy[:,t] := 1 / ( 1 + exp(-z)) where z=buy_W * price_trajectory[:, t] + buy_b
-    """
-    tensors = {
-        "price_trajectory": price_trajectory,
-        "buy_W": buy_W,
-        "buy_b": buy_b,
-    }
-
-    for name, tensor in tensors.items():
-        if not torch.is_tensor(tensor):
-            raise TypeError(f"{name} must be a torch.Tensor")
-
+def get_buy_strategy(price_trajectory: torch.Tensor, model: nn.Module) -> torch.Tensor:
+    """Compute per-stock spending decisions for each point in the trajectory."""
+    if not torch.is_tensor(price_trajectory):
+        raise TypeError("price_trajectory must be a torch.Tensor")
     if price_trajectory.ndim not in (2, 3):
         raise ValueError("price_trajectory must have shape (M, T) or (B, M, T)")
-    if buy_W.ndim != 2:
-        raise ValueError("buy_W must be a 2D tensor of shape (M, M)")
-    if buy_b.ndim != 1:
-        raise ValueError("buy_b must be a 1D tensor of shape (M,)")
+    if not isinstance(model, nn.Module):
+        raise TypeError("model must be an instance of torch.nn.Module")
 
     if price_trajectory.ndim == 2:
         num_stocks, num_steps = price_trajectory.shape
+        batch_dims = ()
     else:
-        _, num_stocks, num_steps = price_trajectory.shape
+        batch_dims = price_trajectory.shape[:-2]
+        num_stocks, num_steps = price_trajectory.shape[-2:]
+
     if num_stocks == 0 or num_steps == 0:
         raise ValueError("price_trajectory must have positive dimensions")
-    if buy_W.shape != (num_stocks, num_stocks):
-        raise ValueError("buy_W must have shape (M, M) matching price_trajectory")
-    if buy_b.shape[0] != num_stocks:
-        raise ValueError("buy_b length must match number of stocks (M)")
 
     device = price_trajectory.device
     dtype = price_trajectory.dtype if torch.is_floating_point(price_trajectory) else torch.float32
-
     price_trajectory = price_trajectory.to(device=device, dtype=dtype)
-    buy_W = buy_W.to(device=device, dtype=dtype)
-    buy_b = buy_b.to(device=device, dtype=dtype)
 
     if price_trajectory.ndim == 2:
-        z = buy_W @ price_trajectory + buy_b.unsqueeze(1)
+        inputs = price_trajectory.transpose(0, 1).reshape(-1, num_stocks)
+        outputs = model(inputs)
+        if outputs.shape[-1] != num_stocks:
+            raise ValueError("Model output dimension does not match number of stocks")
+        buy_strategy = outputs.view(num_steps, num_stocks).transpose(0, 1)
     else:
-        z = torch.einsum("ij,bjt->bit", buy_W, price_trajectory) + buy_b.view(1, -1, 1)
+        permuted = price_trajectory.permute(*range(len(batch_dims)), -1, -2)
+        flattened = permuted.reshape(-1, num_stocks)
+        outputs = model(flattened)
+        if outputs.shape[-1] != num_stocks:
+            raise ValueError("Model output dimension does not match number of stocks")
+        reshaped = outputs.view(*batch_dims, num_steps, num_stocks)
+        buy_strategy = reshaped.permute(*range(len(batch_dims)), -1, -2)
 
-    buy_strategy = z
     return buy_strategy
 
 def gen_price_trajectory(
@@ -403,13 +529,27 @@ def gen_price_trajectory(
 
 
 def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    use_cuda_cfg = cfg.get("use_cuda")
-    use_cuda = True if use_cuda_cfg is None else bool(use_cuda_cfg)
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available() and use_cuda
-        else "cpu"
-    )
+    device_cfg = cfg.get("device")
+    if device_cfg is not None:
+        device_name = str(device_cfg).strip().lower()
+        if device_name == "cpu":
+            device = torch.device("cpu")
+        elif device_name == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA requested via 'device' config but no CUDA-enabled device is available."
+                )
+            device = torch.device("cuda")
+        else:
+            raise ValueError("'device' config must be either 'cpu' or 'cuda'")
+    else:
+        use_cuda_cfg = cfg.get("use_cuda")
+        use_cuda = True if use_cuda_cfg is None else bool(use_cuda_cfg)
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available() and use_cuda
+            else "cpu"
+        )
 
     seed = cfg.get("seed")
     if seed is not None:
@@ -592,46 +732,62 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     checkpoint_interval = max(1, int(math.ceil(max_num_iters * 0.05)))
 
     init_std = 1e-6 / math.sqrt(float(num_stocks))
-    buy_W = torch.normal(
-        mean=0.0,
-        std=init_std,
-        size=(num_stocks, num_stocks),
-        device=device,
-        dtype=torch.float32,
-    )
-    buy_W.requires_grad_()
-    buy_b = torch.normal(
-        mean=0.0,
-        std=init_std,
-        size=(num_stocks,),
-        device=device,
-        dtype=torch.float32,
-    )
-    buy_b.requires_grad_()
+    model_name_cfg = get_train_setting("buy_strategy_model", "linear")
+    model_name = str(model_name_cfg).strip().lower()
+
+    if model_name == "linear":
+        model: nn.Module = LinearBuyStrategyModel(num_stocks, init_std)
+        model_config: Dict[str, Any] = {"init_std": init_std}
+    elif model_name == "mlp":
+        hidden_dim_cfg = get_train_setting("mlp_hidden_dim", None)
+        layers_cfg = get_train_setting("mlp_layers", None)
+        if hidden_dim_cfg is None or layers_cfg is None:
+            raise ValueError(
+                "'mlp_hidden_dim' and 'mlp_layers' must be provided when using the mlp model"
+            )
+        hidden_dim = int(hidden_dim_cfg)
+        num_layers = int(layers_cfg)
+        model = ResidualMLPBuyStrategyModel(num_stocks, hidden_dim, num_layers)
+        model_config = {
+            "mlp_hidden_dim": hidden_dim,
+            "mlp_layers": num_layers,
+        }
+    else:
+        raise ValueError(
+            f"Unsupported buy strategy model '{model_name}'. Expected one of: linear, mlp."
+        )
+
+    model = model.to(device=device, dtype=torch.float32)
+    model_metadata = {
+        "name": model_name,
+        "config": model_config,
+    }
 
     if optimizer_name == "sgd":
-        optimizer = torch.optim.SGD([
-            buy_W,
-            buy_b,
-        ], lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
     elif optimizer_name == "adam":
-        optimizer = torch.optim.Adam([
-            buy_W,
-            buy_b,
-        ], lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=weight_decay
+        )
     else:
         raise ValueError(
             f"Unsupported optimizer '{optimizer_name}'. Expected one of: sgd, adam."
         )
 
-    resume_iteration, final_checkpoint_loaded = load_latest_checkpoint(
+    resume_iteration, final_checkpoint_loaded, checkpoint_metadata = load_latest_checkpoint(
         checkpoint_dir,
         device,
-        buy_W,
-        buy_b,
+        model,
         optimizer,
         max_num_iters,
     )
+
+    if checkpoint_metadata:
+        merged_metadata = dict(checkpoint_metadata)
+        merged_metadata.update(model_metadata)
+        model_metadata = merged_metadata
 
     if resume_iteration > 0 and resume_iteration < max_num_iters:
         print(f"Resuming training from iteration {resume_iteration}.")
@@ -639,6 +795,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         print("Final checkpoint detected; skipping training loop and exporting results.")
 
     training_start_time = time.time()
+    model.train()
 
     for iteration in range(resume_iteration + 1, max_num_iters + 1):
         price_traj = gen_price_trajectory(
@@ -650,7 +807,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             simulation_T,
             batch_size=simulation_batch_size,
         )
-        buy_strategy = get_buy_strategy(price_traj, buy_W, buy_b)
+        buy_strategy = get_buy_strategy(price_traj, model)
         batched_termination_asset_value = get_termination_asset_value(
             price_traj,
             buy_strategy,
@@ -663,7 +820,9 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if gradient_norm_clip is not None:
-            torch.nn.utils.clip_grad_norm_((buy_W, buy_b), max_norm=gradient_norm_clip)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=gradient_norm_clip
+            )
         optimizer.step()
 
         iterations_completed = iteration - resume_iteration
@@ -699,18 +858,19 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             save_checkpoint(
                 checkpoint_dir,
                 iteration,
-                buy_W,
-                buy_b,
+                model,
                 optimizer,
                 max_num_iters,
+                model_metadata,
             )
 
-    buy_W_cpu = buy_W.detach().cpu()
-    buy_b_cpu = buy_b.detach().cpu()
+    model_state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     init_price_cpu = init_price.detach().cpu()
     k_vector_cpu = k_vector.detach().cpu()
     b_vector_cpu = b_vector.detach().cpu()
     std_vector_cpu = std_vector.detach().cpu()
+
+    model.eval()
 
     with torch.no_grad():
         deterministic_price_traj = gen_price_trajectory(
@@ -721,7 +881,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             torch.zeros_like(std_vector),
             simulation_T,
         )
-        buy_strategy_now = get_buy_strategy(deterministic_price_traj, buy_W, buy_b)
+        buy_strategy_now = get_buy_strategy(deterministic_price_traj, model)
 
         shares_held = buy_strategy_now / deterministic_price_traj
         total_shares = shares_held.sum(dim=1)
@@ -755,7 +915,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             simulation_T,
             batch_size=evaluation_batch_size,
         )
-        stochastic_buy_strategy = get_buy_strategy(stochastic_price_traj, buy_W, buy_b)
+        stochastic_buy_strategy = get_buy_strategy(stochastic_price_traj, model)
         stochastic_termination_asset = get_termination_asset_value(
             stochastic_price_traj,
             stochastic_buy_strategy,
@@ -804,9 +964,12 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             },
         }
 
+    model_export = prepare_model_export(model_state_cpu, model_metadata)
+
     return {
-        "buy_W": buy_W_cpu.numpy(),
-        "buy_b": buy_b_cpu.numpy(),
+        "model_state_dict": model_state_cpu,
+        "model_metadata": model_metadata,
+        "model_export": model_export,
         "init_price": init_price_cpu.numpy(),
         "k_vector": k_vector_cpu.numpy(),
         "b_vector": b_vector_cpu.numpy(),
@@ -839,8 +1002,7 @@ def main() -> None:
     buy_model_path = train_output_dir / "buy_model.npz"
     np.savez(
         buy_model_path,
-        buy_W=training_artifacts["buy_W"],
-        buy_b=training_artifacts["buy_b"],
+        **training_artifacts["model_export"],
     )
     print(f"Saved buy parameters to '{buy_model_path}'.")
 

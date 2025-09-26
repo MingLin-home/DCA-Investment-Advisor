@@ -53,6 +53,7 @@ num_workers: 8
 #   batch_gain_alpha: 0.5
 #   log_interval: 1000
 
+device: cpu
 train_buy_strategy:
   simulation_T: 12
   overbuy_penalty_factor: 10.0
@@ -67,3 +68,6 @@ train_buy_strategy:
   batch_gain_alpha: 0.5
   log_interval: 1000
   gradient_norm_clip: 0.1
+  buy_strategy_model: mlp
+  mlp_hidden_dim: 16
+  mlp_layers: 8
