@@ -318,9 +318,9 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
 
-    train_cfg = cfg.get("train_price_model")
+    train_cfg = cfg.get("train_price_eps_model")
     if not isinstance(train_cfg, dict):
-        raise ValueError("config must provide a mapping under 'train_price_model'")
+        raise ValueError("config must provide a mapping under 'train_price_eps_model'")
 
     stock_symbols = cfg.get("stock_symbols")
     if not isinstance(stock_symbols, list) or not stock_symbols:
@@ -355,7 +355,7 @@ def main() -> None:
 
     output_dir = cfg.get("output_dir", "./outputs")
     output_dir = os.path.abspath(os.path.expanduser(str(output_dir)))
-    save_dir = os.path.join(output_dir, "train_price_model")
+    save_dir = os.path.join(output_dir, "train_price_eps_model")
     os.makedirs(save_dir, exist_ok=True)
 
     final_path = os.path.join(save_dir, "model.npz")

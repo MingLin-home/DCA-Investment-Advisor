@@ -34,14 +34,14 @@ simple_forecast_history_start_date: 2023-09-25
 simple_forecast_history_end_date: 2025-09-25
 
 sampling_start_date: 2020-01-01
-sampling_end_date: 2025-09-25
+sampling_end_date: 2025-01-01
 history_window_size: 360
 future_window_size: 360
 agg_windows_size: 30
 train_batch_size: 1024
 num_workers: 8
 
-# train_price_model:
+# train_price_eps_model:
 #   lr: 1e-2
 #   weight_decay: 1e-6
 #   optimizer: sgd
