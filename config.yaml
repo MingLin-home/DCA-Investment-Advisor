@@ -59,11 +59,11 @@ train_buy_strategy:
   sell_penalty_factor: 10.0
   simulate_time_interval: 30
   simulation_batch_size: 1024
-  lr: 1e-6
+  lr: 1e-8
   weight_decay: 0.0
   optimizer: adam
   max_num_iters: 1000000
   loss_avg_decay: 0.99
   batch_gain_alpha: 0.5
   log_interval: 1000
-  gradient_norm_clip: 1.0
+  gradient_norm_clip: 0.1
