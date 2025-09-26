@@ -141,6 +141,25 @@ def save_checkpoint(
         except FileNotFoundError:
             continue
 
+
+def normalize_symbol_list(raw: Any, field_name: str) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)):
+        raw = [raw]
+    if not isinstance(raw, Iterable):
+        raise TypeError(
+            f"Config field '{field_name}' must be an iterable collection of symbols"
+        )
+
+    symbols: list[str] = []
+    for item in raw:
+        symbol = str(item).strip().upper()
+        if not symbol or symbol in symbols:
+            continue
+        symbols.append(symbol)
+    return symbols
+
 def get_batch_gain(batched_termination_asset_value: torch.Tensor, alpha: float):
     """
     batched_termination_asset_value: tensor of shape (simulation_batch_size,)
@@ -384,9 +403,11 @@ def gen_price_trajectory(
 
 
 def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    use_cuda_cfg = cfg.get("use_cuda")
+    use_cuda = True if use_cuda_cfg is None else bool(use_cuda_cfg)
     device = torch.device(
         "cuda"
-        if torch.cuda.is_available() and cfg.get("use_cuda", True)
+        if torch.cuda.is_available() and use_cuda
         else "cpu"
     )
 
@@ -394,17 +415,28 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if seed is not None:
         torch.manual_seed(int(seed))
 
-    stock_symbols = cfg.get("stock_symbols")
-    if isinstance(stock_symbols, str):
-        stock_symbols = [stock_symbols]
-    if not isinstance(stock_symbols, Iterable) or not stock_symbols:
-        raise ValueError("Configuration must define a non-empty 'stock_symbols' list")
+    stock_symbols = normalize_symbol_list(cfg.get("stock_symbols"), "stock_symbols")
+    etf_symbols = normalize_symbol_list(cfg.get("etf_symbols"), "etf_symbols")
 
-    symbols = tuple(str(sym) for sym in stock_symbols)
+    merged_symbols: list[str] = []
+    for collection in (stock_symbols, etf_symbols):
+        for symbol in collection:
+            if symbol not in merged_symbols:
+                merged_symbols.append(symbol)
 
-    base_output_dir = Path(cfg.get("output_dir", "./outputs"))
+    if not merged_symbols:
+        raise ValueError(
+            "Configuration must define at least one symbol via 'stock_symbols' or 'etf_symbols'"
+        )
+
+    symbols = tuple(merged_symbols)
+
+    output_dir_cfg = cfg.get("output_dir")
+    if output_dir_cfg is None:
+        output_dir_cfg = "./outputs"
+    base_output_dir = Path(output_dir_cfg)
     data_dir = base_output_dir / "data"
-    forecast_dir = base_output_dir / "forcast"
+    forecast_dir = base_output_dir / "forecast"
     train_output_dir = base_output_dir / "train_buy_strategy"
     checkpoint_dir = train_output_dir / "checkpoints"
 
@@ -476,24 +508,33 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     def get_train_setting(key: str, default: Any) -> Any:
         """Prefer nested train_buy_strategy overrides, fall back to top level/default."""
-        if key in train_cfg:
+        if key in train_cfg and train_cfg[key] is not None:
             return train_cfg[key]
-        return cfg.get(key, default)
+        value = cfg.get(key)
+        if value is None:
+            return default
+        return value
 
-    simulation_batch_size = int(cfg.get("simulation_batch_size", 128))
+    simulation_batch_size = int(get_train_setting("simulation_batch_size", 128))
     if simulation_batch_size <= 0:
         raise ValueError("'simulation_batch_size' must be a positive integer")
 
-    simulation_T = int(cfg.get("simulation_T", 6))
+    simulation_T_raw = cfg.get("simulation_T")
+    if simulation_T_raw is None:
+        simulation_T_raw = 6
+    simulation_T = int(simulation_T_raw)
     if simulation_T <= 0:
         raise ValueError("'simulation_T' must be a positive integer")
 
-    simulate_time_interval = int(cfg.get("simulate_time_interval", 1))
+    simulate_time_interval = int(get_train_setting("simulate_time_interval", 1))
     simulate_time_interval = max(simulate_time_interval, 1)
 
     lr = float(get_train_setting("lr", 1e-3))
     weight_decay = float(get_train_setting("weight_decay", 0.0))
-    alpha = float(cfg.get("batch_gain_alpha", 0.1))
+    alpha_raw = cfg.get("batch_gain_alpha")
+    if alpha_raw is None:
+        alpha_raw = 0.1
+    alpha = float(alpha_raw)
     if alpha <= 0:
         raise ValueError("'batch_gain_alpha' must be a positive float")
 
@@ -520,7 +561,7 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     log_interval_cfg = get_train_setting("log_interval", None)
     if log_interval_cfg is None:
-        log_interval_iters = max(1, max_num_iters // 10)
+        log_interval_iters = max(1, max_num_iters // 1000)
     else:
         try:
             log_interval_value = float(log_interval_cfg)
@@ -777,7 +818,10 @@ def main() -> None:
 
     training_artifacts = run_training(cfg)
 
-    base_output_dir = Path(cfg.get("output_dir", "./outputs"))
+    output_dir_cfg = cfg.get("output_dir")
+    if output_dir_cfg is None:
+        output_dir_cfg = "./outputs"
+    base_output_dir = Path(output_dir_cfg)
     train_output_dir = base_output_dir / "train_buy_strategy"
     ensure_directory(train_output_dir)
 
