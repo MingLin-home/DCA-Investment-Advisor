@@ -9,7 +9,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -270,36 +269,6 @@ def infer_model_name(model: nn.Module) -> str:
         return "mlp"
     return model.__class__.__name__.lower()
 
-
-def prepare_model_export(
-    state_dict: Dict[str, torch.Tensor],
-    metadata: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Convert a model state dict and metadata to numpy-friendly payload."""
-    state_dict = {k: v.detach().cpu() for k, v in state_dict.items()}
-    export: Dict[str, Any] = {}
-
-    key_list: list[str] = []
-    for idx, (key, tensor) in enumerate(state_dict.items()):
-        key_list.append(key)
-        export[f"param_{idx}"] = tensor.numpy()
-
-    export["model_type"] = np.array(str(metadata.get("name", "")))
-    export["state_keys"] = np.array(key_list)
-
-    config = metadata.get("config")
-    if config is not None:
-        export["model_config_json"] = np.array(json.dumps(config))
-
-    # Provide linear-specific shortcuts for backward compatibility when possible.
-    if metadata.get("name") == "linear":
-        weight = state_dict.get("linear.weight")
-        bias = state_dict.get("linear.bias")
-        if weight is not None and bias is not None:
-            export["buy_W"] = weight.numpy()
-            export["buy_b"] = bias.numpy()
-
-    return export
 
 def get_batch_gain(batched_termination_asset_value: torch.Tensor, alpha: float):
     """
@@ -578,7 +547,9 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
     data_dir = base_output_dir / "data"
     forecast_dir = base_output_dir / "forecast"
     train_output_dir = base_output_dir / "train_buy_strategy"
+    ensure_directory(train_output_dir)
     checkpoint_dir = train_output_dir / "checkpoints"
+    model_pt_path = train_output_dir / "model.pt"
 
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Stock data directory does not exist: {data_dir}")
@@ -763,6 +734,38 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "config": model_config,
     }
 
+    skip_training = False
+    if model_pt_path.is_file():
+        saved_payload = torch.load(model_pt_path, map_location="cpu")
+        if not isinstance(saved_payload, dict):
+            raise ValueError(
+                f"Saved model at '{model_pt_path}' must be a dictionary payload."
+            )
+        saved_state = saved_payload.get("model_state_dict")
+        if saved_state is None:
+            saved_state = saved_payload.get("model_state")
+        if saved_state is None:
+            raise ValueError(
+                f"Saved model at '{model_pt_path}' is missing 'model_state_dict'."
+            )
+        saved_metadata = saved_payload.get("model_metadata")
+        if isinstance(saved_metadata, dict):
+            saved_name = str(saved_metadata.get("name", "")).strip().lower()
+            current_name = str(model_metadata.get("name", "")).strip().lower()
+            if saved_name and saved_name != current_name:
+                raise ValueError(
+                    "Saved model type does not match the configured model type."
+                )
+            merged_metadata = dict(model_metadata)
+            merged_metadata.update(saved_metadata)
+            model_metadata = merged_metadata
+        model.load_state_dict(saved_state)
+        model.to(device=device, dtype=torch.float32)
+        skip_training = True
+        print(
+            f"Found existing trained model at '{model_pt_path}'. Skipping training loop."
+        )
+
     if optimizer_name == "sgd":
         optimizer = torch.optim.SGD(
             model.parameters(), lr=lr, weight_decay=weight_decay
@@ -776,100 +779,114 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             f"Unsupported optimizer '{optimizer_name}'. Expected one of: sgd, adam."
         )
 
-    resume_iteration, final_checkpoint_loaded, checkpoint_metadata = load_latest_checkpoint(
-        checkpoint_dir,
-        device,
-        model,
-        optimizer,
-        max_num_iters,
-    )
+    resume_iteration = 0
+    final_checkpoint_loaded = False
+    checkpoint_metadata: Optional[Dict[str, Any]] = None
 
-    if checkpoint_metadata:
-        merged_metadata = dict(checkpoint_metadata)
-        merged_metadata.update(model_metadata)
-        model_metadata = merged_metadata
-
-    if resume_iteration > 0 and resume_iteration < max_num_iters:
-        print(f"Resuming training from iteration {resume_iteration}.")
-    if final_checkpoint_loaded:
-        print("Final checkpoint detected; skipping training loop and exporting results.")
-
-    training_start_time = time.time()
-    model.train()
-
-    for iteration in range(resume_iteration + 1, max_num_iters + 1):
-        price_traj = gen_price_trajectory(
-            init_price,
-            simulate_time_interval,
-            k_vector,
-            b_vector,
-            std_vector,
-            simulation_T,
-            batch_size=simulation_batch_size,
+    if not skip_training:
+        (
+            resume_iteration,
+            final_checkpoint_loaded,
+            checkpoint_metadata,
+        ) = load_latest_checkpoint(
+            checkpoint_dir,
+            device,
+            model,
+            optimizer,
+            max_num_iters,
         )
-        buy_strategy = get_buy_strategy(price_traj, model)
-        batched_termination_asset_value = get_termination_asset_value(
-            price_traj,
-            buy_strategy,
-            overbuy_penalty_factor,
-            sell_penalty_factor,
-        )
-        batch_gain = get_batch_gain(batched_termination_asset_value, alpha)
 
-        loss = -batch_gain
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if gradient_norm_clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=gradient_norm_clip
+        if checkpoint_metadata:
+            merged_metadata = dict(checkpoint_metadata)
+            merged_metadata.update(model_metadata)
+            model_metadata = merged_metadata
+
+        if resume_iteration > 0 and resume_iteration < max_num_iters:
+            print(f"Resuming training from iteration {resume_iteration}.")
+        if final_checkpoint_loaded:
+            print("Final checkpoint detected; skipping training loop and exporting results.")
+
+        training_start_time = time.time()
+        model.train()
+
+        for iteration in range(resume_iteration + 1, max_num_iters + 1):
+            price_traj = gen_price_trajectory(
+                init_price,
+                simulate_time_interval,
+                k_vector,
+                b_vector,
+                std_vector,
+                simulation_T,
+                batch_size=simulation_batch_size,
             )
-        optimizer.step()
+            buy_strategy = get_buy_strategy(price_traj, model)
+            batched_termination_asset_value = get_termination_asset_value(
+                price_traj,
+                buy_strategy,
+                overbuy_penalty_factor,
+                sell_penalty_factor,
+            )
+            batch_gain = get_batch_gain(batched_termination_asset_value, alpha)
 
-        iterations_completed = iteration - resume_iteration
-        should_log = (
-            iteration == resume_iteration + 1
-            or iteration == max_num_iters
-            or (iteration % log_interval_iters == 0)
-        )
-
-        if should_log:
-            with torch.no_grad():
-                mean_val = batched_termination_asset_value.mean().item()
-                std_val = batched_termination_asset_value.std(unbiased=False).item()
-                elapsed_time = max(time.time() - training_start_time, 0.0)
-                if iterations_completed > 0 and elapsed_time > 0:
-                    remaining_iters = max_num_iters - iteration
-                    eta_seconds = (
-                        elapsed_time / iterations_completed
-                    ) * remaining_iters if remaining_iters > 0 else 0.0
-                else:
-                    eta_seconds = float("inf")
-                eta_display = (
-                    format_seconds(eta_seconds)
-                    if math.isfinite(eta_seconds)
-                    else "--:--:--"
+            loss = -batch_gain
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if gradient_norm_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=gradient_norm_clip
                 )
-                print(
-                    f"iter={iteration:6d} batch_gain={batch_gain.item(): .6f} "
-                    f"mean={mean_val: .6f} std={std_val: .6f} eta={eta_display}"
-                )
+            optimizer.step()
 
-        if iteration % checkpoint_interval == 0 or iteration == max_num_iters:
-            save_checkpoint(
-                checkpoint_dir,
-                iteration,
-                model,
-                optimizer,
-                max_num_iters,
-                model_metadata,
+            iterations_completed = iteration - resume_iteration
+            should_log = (
+                iteration == resume_iteration + 1
+                or iteration == max_num_iters
+                or (iteration % log_interval_iters == 0)
             )
 
-    model_state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    init_price_cpu = init_price.detach().cpu()
-    k_vector_cpu = k_vector.detach().cpu()
-    b_vector_cpu = b_vector.detach().cpu()
-    std_vector_cpu = std_vector.detach().cpu()
+            if should_log:
+                with torch.no_grad():
+                    mean_val = batched_termination_asset_value.mean().item()
+                    std_val = batched_termination_asset_value.std(unbiased=False).item()
+                    elapsed_time = max(time.time() - training_start_time, 0.0)
+                    if iterations_completed > 0 and elapsed_time > 0:
+                        remaining_iters = max_num_iters - iteration
+                        eta_seconds = (
+                            elapsed_time / iterations_completed
+                        ) * remaining_iters if remaining_iters > 0 else 0.0
+                    else:
+                        eta_seconds = float("inf")
+                    eta_display = (
+                        format_seconds(eta_seconds)
+                        if math.isfinite(eta_seconds)
+                        else "--:--:--"
+                    )
+                    print(
+                        f"iter={iteration:6d} batch_gain={batch_gain.item(): .6f} "
+                        f"mean={mean_val: .6f} std={std_val: .6f} eta={eta_display}"
+                    )
 
+            if iteration % checkpoint_interval == 0 or iteration == max_num_iters:
+                save_checkpoint(
+                    checkpoint_dir,
+                    iteration,
+                    model,
+                    optimizer,
+                    max_num_iters,
+                    model_metadata,
+                )
+
+        model_state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        torch.save(
+            {
+                "model_state_dict": model_state_cpu,
+                "model_metadata": model_metadata,
+            },
+            model_pt_path,
+        )
+        print(f"Saved trained model to '{model_pt_path}'.")
+    else:
+        model_state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     model.eval()
 
     with torch.no_grad():
@@ -882,28 +899,24 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             simulation_T,
         )
         buy_strategy_now = get_buy_strategy(deterministic_price_traj, model)
-
-        shares_held = buy_strategy_now / deterministic_price_traj
-        total_shares = shares_held.sum(dim=1)
-        final_prices = deterministic_price_traj[:, -1]
-        termination_stock_value = float((total_shares * final_prices).sum().item())
-        cash_spent = float(buy_strategy_now.sum().item())
-        termination_cash_value = float(1.0 - cash_spent)
-        overbuy_penalty_value = max(cash_spent - 1.0, 0.0) * overbuy_penalty_factor
-        sell_penalty_value = (
-            -buy_strategy_now.clamp(max=0)
-        ).sum().item() * sell_penalty_factor
-        termination_total_asset_value = (
-            termination_stock_value
-            + termination_cash_value
-            - overbuy_penalty_value
-            - sell_penalty_value
-        )
-
-        per_stock_action = {
-            symbol: float(buy_strategy_now[idx, 0].item())
-            for idx, symbol in enumerate(symbols)
-        }
+        buy_strategy_now_cpu = buy_strategy_now.detach().cpu()
+        initial_spend = buy_strategy_now_cpu[:, 0]
+        buy_now_rows: list[Dict[str, float]] = []
+        for idx, symbol in enumerate(symbols):
+            avg_price = float(init_prices[idx])
+            buy_dollar = float(initial_spend[idx].item())
+            if avg_price == 0.0:
+                buy_shares = float("nan")
+            else:
+                buy_shares = buy_dollar / avg_price
+            buy_now_rows.append(
+                {
+                    "stock_symbol": symbol,
+                    "avg_price": avg_price,
+                    "buy_dollar": buy_dollar,
+                    "buy_shares": buy_shares,
+                }
+            )
 
         evaluation_batch_size = simulation_batch_size
         stochastic_price_traj = gen_price_trajectory(
@@ -922,14 +935,6 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
             overbuy_penalty_factor,
             sell_penalty_factor,
         )
-
-        stochastic_buy_strategy_cpu = stochastic_buy_strategy.detach().cpu()
-
-        termination_asset_mean = float(stochastic_termination_asset.mean().item())
-        termination_asset_std = float(
-            stochastic_termination_asset.std(unbiased=False).item()
-        )
-
         shares_per_stock = (stochastic_buy_strategy / stochastic_price_traj).sum(dim=-1)
         shares_mean = shares_per_stock.mean(dim=0)
         shares_std = shares_per_stock.std(dim=0, unbiased=False)
@@ -944,45 +949,46 @@ def run_training(cfg: Dict[str, Any]) -> Dict[str, Any]:
         cash_mean = float(cash_per_simulation.mean().item())
         cash_std = float(cash_per_simulation.std(unbiased=False).item())
 
-        termination_metrics = {
-            "termination_asset": {
-                "mean": termination_asset_mean,
-                "std": termination_asset_std,
-            },
-            "cash": {
-                "mean": cash_mean,
-                "std": cash_std,
-            },
-            "stocks": {
-                symbol: {
-                    "shares_mean": float(shares_mean[idx].item()),
-                    "shares_std": float(shares_std[idx].item()),
-                    "value_mean": float(stock_value_mean[idx].item()),
-                    "value_std": float(stock_value_std[idx].item()),
-                }
-                for idx, symbol in enumerate(symbols)
-            },
-        }
+        termination_asset_mean = float(stochastic_termination_asset.mean().item())
+        termination_asset_std = float(
+            stochastic_termination_asset.std(unbiased=False).item()
+        )
 
-    model_export = prepare_model_export(model_state_cpu, model_metadata)
+        termination_summary_rows: list[Dict[str, float]] = []
+        for idx, symbol in enumerate(symbols):
+            termination_summary_rows.append(
+                {
+                    "stock_symbol": symbol,
+                    "avg_shares": float(shares_mean[idx].item()),
+                    "std_shares": float(shares_std[idx].item()),
+                    "avg_value": float(stock_value_mean[idx].item()),
+                    "std_value": float(stock_value_std[idx].item()),
+                }
+            )
+
+        termination_summary_rows.append(
+            {
+                "stock_symbol": "cash",
+                "avg_shares": 0.0,
+                "std_shares": 0.0,
+                "avg_value": cash_mean,
+                "std_value": cash_std,
+            }
+        )
+        termination_summary_rows.append(
+            {
+                "stock_symbol": "total_assets",
+                "avg_shares": 0.0,
+                "std_shares": 0.0,
+                "avg_value": termination_asset_mean,
+                "std_value": termination_asset_std,
+            }
+        )
 
     return {
-        "model_state_dict": model_state_cpu,
-        "model_metadata": model_metadata,
-        "model_export": model_export,
-        "init_price": init_price_cpu.numpy(),
-        "k_vector": k_vector_cpu.numpy(),
-        "b_vector": b_vector_cpu.numpy(),
-        "std_vector": std_vector_cpu.numpy(),
-        "symbols": symbols,
-        "stochastic_buy_strategy": stochastic_buy_strategy_cpu.numpy(),
-        "buy_action": {
-            **per_stock_action,
-            "termination_stock_value": float(termination_stock_value),
-            "termination_cash_value": float(termination_cash_value),
-            "termination_total_asset_value": float(termination_total_asset_value),
-        },
-        "termination_metrics": termination_metrics,
+        "train_output_dir": train_output_dir,
+        "buy_now_rows": buy_now_rows,
+        "termination_summary_rows": termination_summary_rows,
     }
 
 def main() -> None:
@@ -991,76 +997,20 @@ def main() -> None:
     print(f"Loaded configuration with {len(cfg)} top-level keys from '{args.config}'.")
 
     training_artifacts = run_training(cfg)
-
-    output_dir_cfg = cfg.get("output_dir")
-    if output_dir_cfg is None:
-        output_dir_cfg = "./outputs"
-    base_output_dir = Path(output_dir_cfg)
-    train_output_dir = base_output_dir / "train_buy_strategy"
+    train_output_dir = Path(training_artifacts["train_output_dir"])
     ensure_directory(train_output_dir)
 
-    buy_model_path = train_output_dir / "buy_model.npz"
-    np.savez(
-        buy_model_path,
-        **training_artifacts["model_export"],
+    buy_now_path = train_output_dir / "buy_now.csv"
+    pd.DataFrame.from_records(training_artifacts["buy_now_rows"]).to_csv(
+        buy_now_path, index=False
     )
-    print(f"Saved buy parameters to '{buy_model_path}'.")
+    print(f"Saved buy-now recommendations to '{buy_now_path}'.")
 
-    buy_action_path = train_output_dir / "buy_action_now.json"
-    with buy_action_path.open("w", encoding="utf-8") as f:
-        json.dump(training_artifacts["buy_action"], f, indent=2)
-    print(f"Saved buy action recommendation to '{buy_action_path}'.")
-
-    termination_asset_path = train_output_dir / "termination_asset.csv"
-    metrics = training_artifacts["termination_metrics"]
-    rows = [
-        {
-            "item": "termination_asset",
-            "symbol": "",
-            "mean": metrics["termination_asset"]["mean"],
-            "std": metrics["termination_asset"]["std"],
-        },
-        {
-            "item": "cash",
-            "symbol": "",
-            "mean": metrics["cash"]["mean"],
-            "std": metrics["cash"]["std"],
-        },
-    ]
-
-    for symbol, stock_metrics in metrics["stocks"].items():
-        rows.append(
-            {
-                "item": "shares",
-                "symbol": symbol,
-                "mean": stock_metrics["shares_mean"],
-                "std": stock_metrics["shares_std"],
-            }
-        )
-        rows.append(
-            {
-                "item": "value",
-                "symbol": symbol,
-                "mean": stock_metrics["value_mean"],
-                "std": stock_metrics["value_std"],
-            }
-        )
-
-    pd.DataFrame.from_records(rows).to_csv(termination_asset_path, index=False)
-    print(f"Saved termination asset metrics to '{termination_asset_path}'.")
-
-    stochastic_buy_path = train_output_dir / "stochastic_buy_strategy.csv"
-    stochastic_buy = training_artifacts["stochastic_buy_strategy"]
-    symbols = training_artifacts["symbols"]
-    batch_size, num_stocks, num_steps = stochastic_buy.shape
-    flattened = stochastic_buy.reshape(batch_size, num_stocks * num_steps)
-    columns = [
-        f"{symbol}_t{step}"
-        for symbol in symbols
-        for step in range(num_steps)
-    ]
-    pd.DataFrame(flattened, columns=columns).to_csv(stochastic_buy_path, index=False)
-    print(f"Saved stochastic buy strategy samples to '{stochastic_buy_path}'.")
+    termination_summary_path = train_output_dir / "termination_asset_summary.csv"
+    pd.DataFrame.from_records(training_artifacts["termination_summary_rows"]).to_csv(
+        termination_summary_path, index=False
+    )
+    print(f"Saved termination asset summary to '{termination_summary_path}'.")
 
 
 if __name__ == "__main__":
