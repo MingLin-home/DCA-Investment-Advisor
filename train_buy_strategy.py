@@ -119,18 +119,21 @@ def gen_price_trajectory(
     pred_std: float,
     T: int,
     batch_size: int | None = None,
+    *,
+    pred_std_multiplier: float = 1.0,
 ) -> torch.Tensor:
     """
     Generate price trajectory for M stocks from time t=0 to t=T-1.
     init_price: tensor of shape (1,)
     pred_k, pred_b, pred_std: float numbers
     T: simulation_T in the config.yaml
+    pred_std_multiplier: scales the standard deviation of the noise term
 
     Return:
     price_trajectory: tensor of shape (batch_size, T)
       price_trajectory[..., 0] = init_price ;
-      price_trajectory[..., t] = (pred_k * simulate_time_interval * t + pred_b) / (1 + N(0, pred_std**2)) for t>=1
-      where the noise term is sampled from a Gaussian with mean 0 and std pred_std.
+      price_trajectory[..., t] = (pred_k * simulate_time_interval * t + pred_b) / (1 + N(0, (pred_std_multiplier * pred_std)**2)) for t>=1
+      where the noise term is sampled from a Gaussian with mean 0 and std pred_std * pred_std_multiplier.
     """
     if T <= 0:
         raise ValueError("T must be a positive integer")
@@ -148,6 +151,7 @@ def gen_price_trajectory(
         raise ValueError("init_price must contain exactly one value")
     init_tensor = init_tensor.to(dtype=torch.float32)
     device = init_tensor.device
+    multiplier = float(pred_std_multiplier)
 
     trajectory = torch.empty((batch_size, T), dtype=torch.float32, device=device)
     trajectory[:, 0] = init_tensor[0]
@@ -156,7 +160,7 @@ def gen_price_trajectory(
         steps = torch.arange(1, T, dtype=torch.float32, device=device)
         trend = pred_k * simulate_time_interval * steps + pred_b
         trend = trend.unsqueeze(0).expand(batch_size, -1)
-        std = float(abs(pred_std))
+        std = float(abs(multiplier) * abs(pred_std))
         if std > 0.0:
             noise = torch.randn((batch_size, T - 1), dtype=torch.float32, device=device) * std
         else:
@@ -336,6 +340,7 @@ def find_optimal_buy_strategy(cfg: Mapping[str, Any]) -> None:
     batch_size = int(train_cfg.get("simulation_batch_size", 1))
     grid_size = int(train_cfg.get("grid_size", 0))
     alpha = float(train_cfg.get("buy_strategy_alpha", 0.0))
+    pred_std_multiplier = float(train_cfg.get("pred_std_multiplier", 1.0))
     device = torch.device(str(train_cfg.get("device", "cpu")))
 
     if simulation_T <= 0:
@@ -370,6 +375,7 @@ def find_optimal_buy_strategy(cfg: Mapping[str, Any]) -> None:
                 pred_std,
                 simulation_T,
                 batch_size=batch_size,
+                pred_std_multiplier=pred_std_multiplier,
             )
 
         records: list[dict[str, float]] = []
