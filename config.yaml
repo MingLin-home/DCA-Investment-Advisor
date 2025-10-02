@@ -1,31 +1,9 @@
 output_dir: "./outputs"
 columns:
 - avg_price
-- EPS
-
-
-etf_symbols:
-- QQQ
-- VGT
-- VOO
-
 
 stock_symbols:
-- NVDA
-- META
-- NFLX
-- MSFT
-- AMZN
-- AVGO
-- TSLA
-- GOOGL
-- GOOG
-- COST
-- PEP
-- CSCO
-- QCOM
-# - ADBE
-# - INTC
+- QQQ
 
 stock_start_date: 2020-01-01
 stock_end_date: 2025-09-25
@@ -33,38 +11,13 @@ stock_end_date: 2025-09-25
 simple_forecast_history_start_date: 2023-09-25
 simple_forecast_history_end_date: 2025-09-25
 
-sampling_start_date: 2020-01-01
-sampling_end_date: 2025-01-01
-history_window_size: 360
-future_window_size: 360
-agg_windows_size: 30
 
-num_workers: 8
-
-train_price_eps_model:
-  train_batch_size: 1024
-  lr: 1e-8
-  weight_decay: 1e-6
-  optimizer: adam
-  max_num_iters: 1000000
-  loss_avg_decay: 0.99
-  log_interval: 1000
-
-device: cpu
 train_buy_strategy:
-  simulation_T: 12
-  overbuy_penalty_factor: 10.0
-  sell_penalty_factor: 10.0
+  num_workers: 8
+  device: cpu
+  simulation_T: 12  
   simulate_time_interval: 30
   simulation_batch_size: 1024
-  lr: 1e-8
-  weight_decay: 0.0
-  optimizer: adam
-  max_num_iters: 1000000
-  loss_avg_decay: 0.99
-  batch_gain_alpha: 0.5
-  log_interval: 1000
-  gradient_norm_clip: 0.1
-  buy_strategy_model: mlp
-  mlp_hidden_dim: 16
-  mlp_layers: 8
+  b_from: 0
+  b_to: 2  
+  grid_size: 10

@@ -11,7 +11,8 @@ python simple_forecast.py --config ./config.yaml
 Config requirements
 -------------------
 - ``output_dir`` must point to the data root created by the download scripts.
-- ``stock_symbols`` and/or ``etf_symbols`` provide tickers to process.
+- ``stock_symbols`` provides tickers to process (``etf_symbols`` is optionally
+  honoured for backward compatibility).
 - ``simple_forecast_history_start_date`` and ``simple_forecast_history_end_date``
   delimit the inclusive date range using ``YYYY-MM-DD``.
 
@@ -66,21 +67,29 @@ def load_config(path: str) -> Mapping[str, Any]:
     return data
 
 
-def gather_symbols(cfg: Mapping[str, Any]) -> List[str]:
-    symbols: List[str] = []
-    for key in ("stock_symbols", "etf_symbols"):
-        raw = cfg.get(key)
-        if raw is None:
+def _normalize_symbol_list(raw: Any, field: str) -> List[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes)):
+        raise TypeError(f"Config field '{field}' must be a list of tickers")
+    result: List[str] = []
+    for item in raw:
+        symbol = str(item).strip().upper()
+        if not symbol or symbol in result:
             continue
-        if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes)):
-            raise TypeError(f"Config field '{key}' must be a list of tickers")
-        for item in raw:
-            symbol = str(item).strip().upper()
-            if not symbol or symbol in symbols:
-                continue
-            symbols.append(symbol)
+        result.append(symbol)
+    return result
+
+
+def gather_symbols(cfg: Mapping[str, Any]) -> List[str]:
+    symbols = _normalize_symbol_list(cfg.get("stock_symbols"), "stock_symbols")
     if not symbols:
-        raise ValueError("No symbols provided; populate 'stock_symbols' or 'etf_symbols'")
+        raise ValueError("Config must define at least one ticker via 'stock_symbols'")
+
+    legacy_etf = _normalize_symbol_list(cfg.get("etf_symbols"), "etf_symbols")
+    for symbol in legacy_etf:
+        if symbol not in symbols:
+            symbols.append(symbol)
     return symbols
 
 

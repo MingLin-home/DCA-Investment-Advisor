@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 import yaml
@@ -36,6 +36,26 @@ def ensure_required_keys(cfg: Dict, keys: Iterable[str]) -> None:
     missing = [key for key in keys if key not in cfg]
     if missing:
         raise KeyError(f"Config file is missing required keys: {', '.join(missing)}")
+
+
+def _normalize_symbol_list(raw: Any, field: str, *, required: bool) -> List[str]:
+    if raw is None:
+        if required:
+            raise ValueError(f"'{field}' must be provided in the config")
+        return []
+    if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes)):
+        raise ValueError(f"'{field}' must be a list of tickers")
+
+    symbols: List[str] = []
+    for item in raw:
+        symbol = str(item).strip().upper()
+        if not symbol or symbol in symbols:
+            continue
+        symbols.append(symbol)
+
+    if required and not symbols:
+        raise ValueError(f"'{field}' must contain at least one ticker")
+    return symbols
 
 
 def parse_date(date_str: str) -> datetime:
@@ -95,17 +115,12 @@ def main() -> None:
     required_keys = ["stock_symbols", "stock_start_date", "stock_end_date", "output_dir"]
     ensure_required_keys(cfg, required_keys)
 
-    stock_symbols = cfg["stock_symbols"]
-    if not isinstance(stock_symbols, (list, tuple)) or not stock_symbols:
-        raise ValueError("'stock_symbols' must be a non-empty list")
-
-    etf_symbols = cfg.get("etf_symbols", [])
-    if etf_symbols is None:
-        etf_symbols = []
-    if not isinstance(etf_symbols, (list, tuple)):
-        raise ValueError("'etf_symbols' must be a list when provided")
-
-    all_symbols: List[str] = list(dict.fromkeys(list(stock_symbols) + list(etf_symbols)))
+    stock_symbols = _normalize_symbol_list(cfg.get("stock_symbols"), "stock_symbols", required=True)
+    etf_symbols = _normalize_symbol_list(cfg.get("etf_symbols"), "etf_symbols", required=False)
+    all_symbols: List[str] = [*stock_symbols]
+    for symbol in etf_symbols:
+        if symbol not in all_symbols:
+            all_symbols.append(symbol)
 
     start_date = parse_date(str(cfg["stock_start_date"]))
     end_date = parse_date(str(cfg["stock_end_date"]))
@@ -116,15 +131,12 @@ def main() -> None:
     raw_data_dir = output_dir / "raw_data"
 
     for symbol in all_symbols:
-        symbol_str = str(symbol).strip().upper()
-        if not symbol_str:
-            continue
-        print(f"Fetching {symbol_str} from {start_date.date()} to {end_date.date()}")
-        df = fetch_stock_prices(symbol_str, start_date, end_date)
+        print(f"Fetching {symbol} from {start_date.date()} to {end_date.date()}")
+        df = fetch_stock_prices(symbol, start_date, end_date)
         if df.empty:
-            print(f"No data returned for {symbol_str}; skipping")
+            print(f"No data returned for {symbol}; skipping")
             continue
-        output_path = raw_data_dir / f"{symbol_str}_price.csv"
+        output_path = raw_data_dir / f"{symbol}_price.csv"
         save_prices(df, output_path)
         print(f"Saved {len(df)} rows to {output_path}")
 

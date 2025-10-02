@@ -5,7 +5,8 @@ python impute_data.py \
 
 "--config" is optional. By default, it loads ./config.yaml
 
-It reads all stock symbols in "stock_symbols" and ETF symbols in "etf_symbols" in the ./config.yaml.
+It reads all stock symbols in "stock_symbols" (with optional legacy tickers in
+"etf_symbols", when present) from ./config.yaml.
 
 For each symbol:
 - it reads "avg_price", "date" from <output_dir>/raw_data/<symbol>_price.csv
@@ -86,16 +87,20 @@ def normalize_symbols(raw_symbols: Any, field_name: str, required: bool = True) 
     if raw_symbols is None:
         if not required:
             return []
-        raise ValueError(f"'{field_name}' must be a non-empty list of strings")
+        raise ValueError(f"'{field_name}' must provide at least one ticker")
 
     if not isinstance(raw_symbols, Iterable) or isinstance(raw_symbols, (str, bytes)):
-        raise ValueError(f"'{field_name}' must be a non-empty list of strings")
+        raise TypeError(f"'{field_name}' must be a list of tickers")
 
-    symbols = [str(symbol).strip().upper() for symbol in raw_symbols if str(symbol).strip()]
-    if not symbols:
-        if required:
-            raise ValueError(f"No valid entries found in '{field_name}' configuration")
-        return []
+    symbols: list[str] = []
+    for symbol in raw_symbols:
+        normalized = str(symbol).strip().upper()
+        if not normalized or normalized in symbols:
+            continue
+        symbols.append(normalized)
+
+    if required and not symbols:
+        raise ValueError(f"'{field_name}' must contain at least one valid ticker")
     return symbols
 
 
