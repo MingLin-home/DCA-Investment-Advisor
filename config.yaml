@@ -17,12 +17,12 @@ train_buy_strategy:
   device: cpu
   simulation_T: 12  
   simulate_time_interval: 30
-  simulation_batch_size: 1024
+  simulation_batch_size: 4096
   buy_strategy_a_from: 0.0
   buy_strategy_a_to: 2.0
   buy_strategy_b_from: 0.0
   buy_strategy_b_to: 1.0
   buy_strategy_c_from: 0.0
   buy_strategy_c_to: 2.0
-  buy_strategy_alpha: 2.0
+  buy_strategy_alpha: 1.0
   grid_size: 10

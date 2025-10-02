@@ -129,7 +129,7 @@ def gen_price_trajectory(
     Return:
     price_trajectory: tensor of shape (batch_size, T)
       price_trajectory[..., 0] = init_price ;
-      price_trajectory[..., t] = pred_k * simulate_time_interval * t + pred_b + N(0, pred_std) for t>=1
+      price_trajectory[..., t] = (pred_k * simulate_time_interval * t + pred_b) / (1 + N(0, pred_std**2)) for t>=1
       where the noise term is sampled from a Gaussian with mean 0 and std pred_std.
     """
     if T <= 0:
@@ -161,7 +161,13 @@ def gen_price_trajectory(
             noise = torch.randn((batch_size, T - 1), dtype=torch.float32, device=device) * std
         else:
             noise = torch.zeros((batch_size, T - 1), dtype=torch.float32, device=device)
-        trajectory[:, 1:] = trend + noise
+
+        denom = 1.0 + noise
+        if torch.any(denom == 0):
+            eps = torch.finfo(denom.dtype).eps
+            denom = denom.masked_fill(denom == 0, eps)
+
+        trajectory[:, 1:] = trend / denom
 
     return trajectory
 
