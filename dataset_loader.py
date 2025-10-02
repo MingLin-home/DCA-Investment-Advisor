@@ -3,6 +3,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+from config_dates import normalize_config_date_str
 """
 This module uses NumPy arrays exclusively. PyTorch tensors are not used.
 """
@@ -120,16 +122,16 @@ class SingleStockDataset:
     # --- Utilities ---
     @staticmethod
     def _parse_date_to_ts(date_str: str) -> int:
-        """Parse YYYY-MM-DD to epoch seconds at 00:00:00 UTC."""
-        if date_str is None:
-            raise ValueError("date string must not be None")
-        s = str(date_str).strip()
-        if s == "":
-            raise ValueError("date string must not be empty")
+        """Parse config date token to epoch seconds at 00:00:00 UTC."""
+
         try:
-            ts = pd.to_datetime(s, format="%Y-%m-%d", utc=True)
-        except Exception as e:
-            raise ValueError(f"Invalid date format '{date_str}', expected YYYY-MM-DD") from e
+            normalized = normalize_config_date_str(date_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid date format '{date_str}', expected YYYY-MM-DD or 'today[-X]'"
+            ) from exc
+
+        ts = pd.to_datetime(normalized, format="%Y-%m-%d", utc=True)
         return int(ts.timestamp())
 
     def __len__(self) -> int:
@@ -151,30 +153,23 @@ class SingleStockDataset:
         raw_start = cfg.get("sampling_start_date")
         raw_end = cfg.get("sampling_end_date")
 
-        start_str = self._normalize_sampling_date(raw_start)
-        end_str = self._normalize_sampling_date(raw_end)
+        start_str = self._normalize_sampling_date(raw_start, field="sampling_start_date")
+        end_str = self._normalize_sampling_date(raw_end, field="sampling_end_date")
 
         # Only apply if at least one bound is provided
         if start_str is not None or end_str is not None:
             self.set_sample_range_by_date(start_str, end_str)
 
     @staticmethod
-    def _normalize_sampling_date(val: Optional[str]) -> Optional[str]:
+    def _normalize_sampling_date(val: Optional[str], *, field: str) -> Optional[str]:
         """Normalize date to 'YYYY-MM-DD' or return None if missing/empty.
 
         Accepts only ISO date string 'YYYY-MM-DD'. Whitespace is ignored.
         """
-        if val is None:
-            return None
-        s = str(val).strip()
-        if s == "":
-            return None
-        # Expect ISO-like date; validate via pandas with strict format
         try:
-            dt = pd.to_datetime(s, format="%Y-%m-%d", utc=True)
-            return dt.strftime("%Y-%m-%d")
-        except Exception as e:
-            raise ValueError(f"Unrecognized date format: {val}") from e
+            return normalize_config_date_str(val, field=field, allow_empty=True)
+        except ValueError as exc:
+            raise ValueError(f"Unrecognized date format for {field}: {val}") from exc
 
     def set_sampling_range_by_index(self, from_idx: int, to_idx: int) -> None:
         """

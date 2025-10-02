@@ -35,6 +35,8 @@ import pandas as pd
 import torch
 import yaml
 
+from config_dates import normalize_config_date_str
+
 LOGGER = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = "./config.yaml"
 _EPS = 1e-6
@@ -101,16 +103,11 @@ def resolve_paths(cfg: Mapping[str, Any]) -> tuple[Path, Path]:
     return data_dir, forecast_dir
 
 
-def _parse_date(value: Any) -> pd.Timestamp | None:
-    if value is None:
+def _parse_date(value: Any, field: str) -> pd.Timestamp | None:
+    normalized = normalize_config_date_str(value, field=field, allow_empty=True)
+    if normalized is None:
         return None
-    s = str(value).strip()
-    if not s:
-        return None
-    try:
-        return pd.to_datetime(s, format="%Y-%m-%d", utc=True)
-    except Exception as err:
-        raise ValueError(f"Invalid date '{value}', expected YYYY-MM-DD") from err
+    return pd.to_datetime(normalized, format="%Y-%m-%d", utc=True)
 
 
 def load_price_series(
@@ -215,8 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     symbols = gather_symbols(cfg)
     data_dir, forecast_dir = resolve_paths(cfg)
 
-    start_date = _parse_date(cfg.get("simple_forecast_history_start_date"))
-    end_date = _parse_date(cfg.get("simple_forecast_history_end_date"))
+    start_date = _parse_date(cfg.get("simple_forecast_history_start_date"), "simple_forecast_history_start_date")
+    end_date = _parse_date(cfg.get("simple_forecast_history_end_date"), "simple_forecast_history_end_date")
 
     LOGGER.info("Generating forecast for %d symbols", len(symbols))
 

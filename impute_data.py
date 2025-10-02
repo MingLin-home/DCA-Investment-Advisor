@@ -31,6 +31,8 @@ from typing import Any, Dict, Iterable, Optional
 import pandas as pd
 import yaml
 
+from config_dates import parse_config_date
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,15 +74,7 @@ def ensure_required_keys(cfg: Dict[str, Any], keys: Iterable[str]) -> None:
 
 
 def parse_date(value: Any, field: str) -> datetime:
-    if value is None:
-        raise ValueError(f"Config key '{field}' cannot be null")
-    text = str(value).strip()
-    if text == "":
-        raise ValueError(f"Config key '{field}' cannot be empty")
-    try:
-        return datetime.strptime(text, "%Y-%m-%d")
-    except ValueError as exc:
-        raise ValueError(f"Config key '{field}' must use YYYY-MM-DD format") from exc
+    return parse_config_date(value, field=field)
 
 
 def normalize_symbols(raw_symbols: Any, field_name: str, required: bool = True) -> list[str]:

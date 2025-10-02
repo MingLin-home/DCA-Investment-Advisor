@@ -11,6 +11,8 @@ import pandas as pd
 import yaml
 import yfinance as yf
 
+from config_dates import parse_config_date
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download stock price data using yfinance")
@@ -58,11 +60,8 @@ def _normalize_symbol_list(raw: Any, field: str, *, required: bool) -> List[str]
     return symbols
 
 
-def parse_date(date_str: str) -> datetime:
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError as exc:
-        raise ValueError(f"Date '{date_str}' must use YYYY-MM-DD format") from exc
+def parse_date(value: Any, field: str) -> datetime:
+    return parse_config_date(value, field=field)
 
 
 def fetch_stock_prices(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
@@ -122,8 +121,8 @@ def main() -> None:
         if symbol not in all_symbols:
             all_symbols.append(symbol)
 
-    start_date = parse_date(str(cfg["stock_start_date"]))
-    end_date = parse_date(str(cfg["stock_end_date"]))
+    start_date = parse_date(cfg["stock_start_date"], "stock_start_date")
+    end_date = parse_date(cfg["stock_end_date"], "stock_end_date")
     if end_date < start_date:
         raise ValueError("'stock_end_date' must be on or after 'stock_start_date'")
 
