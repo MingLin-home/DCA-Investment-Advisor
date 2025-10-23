@@ -1,9 +1,6 @@
 pandas
 numpy
-transformers
-accelerate
 pyyaml
 torch
 yfinance
-pytest
 matplotlib
