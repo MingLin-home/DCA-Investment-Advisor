@@ -128,7 +128,7 @@ class SingleStockDataset:
             normalized = normalize_config_date_str(date_str)
         except ValueError as exc:
             raise ValueError(
-                f"Invalid date format '{date_str}', expected YYYY-MM-DD or 'today[-X]'"
+                f"Invalid date format '{date_str}', expected YYYY-MM-DD or 'today[-X$]'"
             ) from exc
 
         ts = pd.to_datetime(normalized, format="%Y-%m-%d", utc=True)

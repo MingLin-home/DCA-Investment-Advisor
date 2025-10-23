@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 
-_RELATIVE_PATTERN = re.compile(r"^today(?:-(\d+))?$", re.IGNORECASE)
+_RELATIVE_PATTERN = re.compile(r"^today(?:-(\d+))?(?:\$)?$", re.IGNORECASE)
 
 
 def _field_label(field: str | None) -> str:
@@ -38,14 +38,14 @@ def _parse_date_text(text: str) -> datetime:
 
 
 def parse_config_date(value: Any, field: str | None = None) -> datetime:
-    """Parse a required config date supporting YYYY-MM-DD and 'today[-X]'."""
+    """Parse a required config date supporting YYYY-MM-DD and 'today[-X$]'."""
 
     text = _coerce_date_text(value, field, allow_empty=False)
     assert text is not None  # for mypy; handled by allow_empty flag
     try:
         return _parse_date_text(text)
     except ValueError as exc:
-        raise ValueError(f"{_field_label(field)} must use YYYY-MM-DD or 'today[-X]' format") from exc
+        raise ValueError(f"{_field_label(field)} must use YYYY-MM-DD or 'today[-X$]' format") from exc
 
 
 def parse_optional_config_date(value: Any, field: str | None = None) -> Optional[datetime]:
@@ -57,7 +57,7 @@ def parse_optional_config_date(value: Any, field: str | None = None) -> Optional
     try:
         return _parse_date_text(text)
     except ValueError as exc:
-        raise ValueError(f"{_field_label(field)} must use YYYY-MM-DD or 'today[-X]' format") from exc
+        raise ValueError(f"{_field_label(field)} must use YYYY-MM-DD or 'today[-X$]' format") from exc
 
 
 def normalize_config_date_str(
@@ -74,4 +74,3 @@ def normalize_config_date_str(
     else:
         dt = parse_config_date(value, field)
     return dt.strftime("%Y-%m-%d")
-

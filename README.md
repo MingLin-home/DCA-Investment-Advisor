@@ -1,60 +1,48 @@
 # DCA-Investment-Advisor
-An auto-regressive transformer model for Dollar-Cost Averaging (DCA) investment.
 
+A simple machine learning based tool to help me on Dollar-Cost Averaging (DCA) investment.
+
+
+## Warning
+
+This is a personal project just for fun. Use this tool at your own risk. **You might loose all your money if you trust this tool blindly.**
 
 ## Installation
 
 ```
+# [optional] create conda virtual environment
+conda create --prefix=./venv python=3.11 -y
 conda activate ./venv
 pip install -r requirements.txt
 ```
 
-## Configuration
+## ## Usage
 
-`config.yaml` stores configuration variables.
-- "stock_symbols": a list of strings of the stock symbols we want to track.
+Set your configuration in `config.yaml`, particularly, `stock_symbols` is the stocks your want to buy.
 
-## Data Download
-
-Download historical daily data for symbols in `config.yaml` and write one CSV per symbol:
+In bash shell:
 
 ```
-python download_data.py \
-  --config config.yaml \
-  --output outputs/data
+bash run.sh
 ```
 
-Flags are optional; defaults are `--config config.yaml` and `--output outputs`.
-The script saves data to `<output>/data/{SYMBOL}.csv` and raw frames to `<output>/raw_data/{SYMBOL}.raw.csv`.
+This will download real-time stock price data to `outputs/data` and generate a price prediction model in the `outputs/forecast`. Then it will train the buying strategy model in `outputs/train_buy_strategy`.
 
-Example:
-
-```
-python download_data.py --output ./outputs
-```
-
-Creates:
-- `./outputs/data/QQQ.csv`
-- `./outputs/raw_data/QQQ.raw.csv`
-
-Notes:
-- `stock_start_date` and `stock_end_date` are in `YYYY-MM-DD` format; `stock_end_date` may be `today`.
-- CSV columns: `stock_symbol`, `date`, `avg_price`, `timestamp`, `ESP`, `FCF`, `PBR`, `ROE`.
-- `avg_price` is computed as (High + Low + Close) / 3 for each day.
-- Fundamental fields are latest available values repeated across days (may be missing for some symbols).
-
-### Using Alpha Vantage
-
-An alternative script uses the Alpha Vantage API instead of yfinance. Set your API key in the environment variable `alpha_vantage_api_key` and run:
+The final buying suggestion will be printed to the screen, for example:
 
 ```
-export alpha_vantage_api_key=YOUR_KEY
-python download_data_alpha_vantage.py --config config.yaml --output outputs
+QQQ: best a=0.8889, b=1.0000, c=0.2222 -> total=1.1816, std=0.1304, score=1.1164, initial spend=0.1993, initial shares=0.0003, price=608.1367
 ```
 
-It writes CSVs with the same schema as above to `outputs/raw_data/{SYMBOL}.csv` and does not save a separate `.raw.csv` file. Respect free-tier rate limits when downloading many symbols.
+This means:
+
+- You should be QQQ today with 19.93% of your total cash budget. That is, if you have $1 to invest today, you should spend  $0.1993.
+- The price of QQQ today is  $608.1367.
+- The model assumes that you will repeat the buying action monthly
+- The total asset value after 12 months is expected to be $1.1816 if your total cash budget is $1 today.
+- The alpha-sigma lower bound of your 12-month predicted asset value of $1.1164. The alpha value is specified in `buy_strategy_alpha` variable.
 
 
-## Loss function
+## How it works
 
-$ \mathcal{L}(x, y) = \log \sigma(x) + \frac{1}{2} \frac{(y-\mu(x))^2} sigma(x)^2} $
+help me write this session. tell the user how it download and impute data, train price prediction model and the buy strategy model. explain the machine learning models i used in price prediction and buying strategy.
