@@ -105,6 +105,10 @@ Interpretation:
 - `score` applies the risk penalty, i.e. `mean_total - alpha * std`.
 - The full CSV (`outputs/train_buy_strategy/QQQ.csv`) lists every combination and includes additional aggregates (`mean_stock_shares`, `mean_cash`, etc.) for deeper analysis.
 
+You can find the visualization of the price prediction model in `outputs/forecase/<stock_symbol>.png` , for example:
+
+![QQQ Price History and Prediction](./docs/QQQ.png)
+
 ## How It Works
 
 **Data ingestion** — `download_data.py` queries `yfinance` for daily bars (`High`, `Low`, `Close`), computes a simple average price per day, and stores one CSV per ticker. Optional EPS series are merged if `raw_data/<symbol>_eps.csv` exists. `impute_data.py` builds a complete daily index between `stock_start_date` and `stock_end_date`, inserts missing rows, and fills gaps by copying the nearest available price/EPS observation. It also adds a Unix `timestamp` column required by other components.
