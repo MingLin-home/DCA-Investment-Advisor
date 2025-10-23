@@ -14,7 +14,6 @@ simple_forecast_history_end_date: today
 
 
 train_buy_strategy:
-  num_workers: 8
   device: cpu
   simulation_T: 12
   simulate_time_interval: 30
