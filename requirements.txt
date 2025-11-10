@@ -1,6 +1,7 @@
 pandas
 numpy
 pyyaml
-torch
+
+
 yfinance
 matplotlib

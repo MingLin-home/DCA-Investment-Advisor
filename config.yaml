@@ -6,10 +6,10 @@ stock_symbols:
 - QQQ
 # - VOO
 
-stock_start_date: today-360
+stock_start_date: today-720
 stock_end_date: today
 
-simple_forecast_history_start_date: today-360
+simple_forecast_history_start_date: today-720
 simple_forecast_history_end_date: today
 
 
